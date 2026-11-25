@@ -1,0 +1,8 @@
+{
+  "name": "JoyEnglish — Worksheet Generator",
+  "description": "Modern worksheet and flashcard generator for teachers and students with Excel/ZIP import, multi-version exam codes, Mix A4 optimization, live canvas proofing, and print-exact PDF export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-handwritten: "Segoe Print", "Bradley Hand", "Chalkboard SE", "Comic Sans MS", cursive;
+}
+
+@font-face {
+  font-family: "KGPen";
+  src: url("/fonts/KGPrimaryPenmanshipAlt.ttf") format("truetype");
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "KGDots";
+  src: url("/fonts/KGPrimaryDots.ttf") format("truetype");
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "DejaVuWorksheet";
+  src: url("/fonts/DejaVuSans.ttf") format("truetype");
+  font-display: swap;
+}
+
+.font-handwritten {
+  font-family: var(--font-handwritten);
+}
+
+.font-penmanship {
+  font-family: "KGPen", "DejaVuWorksheet", sans-serif;
+}
+
+.font-dotted {
+  font-family: "KGDots", "DejaVuWorksheet", sans-serif;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    color: #0f172a;
+    background-color: #f8fafc;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle paper drafting grid for the live proofing canvas stage */
+.proofing-stage {
+  background-color: #eef2f6;
+  background-image: radial-gradient(#cbd5e1 0.75px, transparent 0.75px);
+  background-size: 16px 16px;
+}
+
+@media print {
+  body {
+    background: #ffffff !important;
+  }
+}
