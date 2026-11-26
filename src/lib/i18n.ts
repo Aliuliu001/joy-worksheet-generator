@@ -99,7 +99,33 @@ export interface Dictionary {
     customFontAlignmentTitle: string;
     customFontScaleLabel: string;
     customFontBaselineLabel: string;
+    customFontLetterSpacingLabel: string;
     customFontReset: string;
+    customFontInspectorTitle: string;
+    customFontInspectorHint: string;
+    customFontInspectorNeedsCheck: string;
+    customFontInspectorAllClear: string;
+    customFontInspectorWordLabel: string;
+    customFontInspectorWordPlaceholder: string;
+    customFontStatusOverlap: string;
+    customFontStatusTight: string;
+    customFontAutoFixBtn: string;
+    customFontAutoFixRunning: string;
+    customFontAutoFixUndo: string;
+    customFontAutoFixOverlap: string;
+    customFontAutoFixTight: string;
+    customFontAutoFixWide: string;
+    customFontAutoFixBalanced: string;
+    customFontLigatureTitle: string;
+    customFontLigatureHint: string;
+    customFontLigaturePairPlaceholder: string;
+    customFontLigatureAddPair: string;
+    customFontLigaturePresetsLabel: string;
+    customFontLigatureJoinOverlap: string;
+    customFontLigatureClearAll: string;
+    customFontLigatureEmpty: string;
+    customFontLigatureActiveCount: string;
+    customFontLigatureRemoveRule: string;
     fontSizeLabel: string;
     fontSizeSmall: string;
     fontSizeNormal: string;
@@ -294,7 +320,33 @@ export const COPY: Record<Locale, Dictionary> = {
       customFontAlignmentTitle: 'Ô Ly Grid Alignment',
       customFontScaleLabel: 'Scale',
       customFontBaselineLabel: 'Baseline Offset',
+      customFontLetterSpacingLabel: 'Letter Spacing (Kerning)',
       customFontReset: 'Reset',
+      customFontInspectorTitle: 'Character Inspector',
+      customFontInspectorHint: 'Click any pair to inspect its full word live on ô ly lines.',
+      customFontInspectorNeedsCheck: 'tight',
+      customFontInspectorAllClear: 'All pairs clear',
+      customFontInspectorWordLabel: 'Test word',
+      customFontInspectorWordPlaceholder: 'Type a word to inspect...',
+      customFontStatusOverlap: 'Overlap',
+      customFontStatusTight: 'Tight',
+      customFontAutoFixBtn: 'Run Calibration Auto-Fix',
+      customFontAutoFixRunning: 'Analyzing...',
+      customFontAutoFixUndo: 'Undo',
+      customFontAutoFixOverlap: 'Analyzed "ca" overlap and set Letter Spacing to {value}.',
+      customFontAutoFixTight: 'Analyzed tight "ca" pair and set Letter Spacing to {value}.',
+      customFontAutoFixWide: 'Analyzed wide "ca" spacing and tightened Letter Spacing to {value}.',
+      customFontAutoFixBalanced: 'Analyzed "ca" pair: native spacing is already balanced ({value}).',
+      customFontLigatureTitle: 'Advanced Ligature',
+      customFontLigatureHint: 'Define per-pair Join Overlap (%) to pull strokes closer (+%) or widen crowded pairs (-%).',
+      customFontLigaturePairPlaceholder: 'Pair (e.g. br, st)',
+      customFontLigatureAddPair: 'Add Pair',
+      customFontLigaturePresetsLabel: 'Quick pairs',
+      customFontLigatureJoinOverlap: 'Join Overlap',
+      customFontLigatureClearAll: 'Clear all',
+      customFontLigatureEmpty: 'No custom pair overlaps yet. Pick a quick pair above or enter any 2 letters.',
+      customFontLigatureActiveCount: 'active',
+      customFontLigatureRemoveRule: 'Remove pair rule',
       fontSizeLabel: 'Font Size',
       fontSizeSmall: 'Small (1 ô ly)',
       fontSizeNormal: 'Normal (2 ô ly · 2×)',
@@ -491,7 +543,33 @@ export const COPY: Record<Locale, Dictionary> = {
       customFontAlignmentTitle: 'Căn chỉnh trên dòng kẻ ô ly',
       customFontScaleLabel: 'Tỷ lệ chữ (Scale)',
       customFontBaselineLabel: 'Độ lệch đường cơ sở (Baseline Offset)',
+      customFontLetterSpacingLabel: 'Khoảng cách chữ (Kerning)',
       customFontReset: 'Đặt lại',
+      customFontInspectorTitle: 'Kiểm tra cặp chữ (Character Inspector)',
+      customFontInspectorHint: 'Bấm vào cặp chữ để phóng to cả từ trực tiếp trên dòng kẻ ô ly.',
+      customFontInspectorNeedsCheck: 'cần chỉnh',
+      customFontInspectorAllClear: 'Tất cả cặp rõ nét',
+      customFontInspectorWordLabel: 'Từ kiểm tra',
+      customFontInspectorWordPlaceholder: 'Nhập từ để kiểm tra...',
+      customFontStatusOverlap: 'Chồng nét',
+      customFontStatusTight: 'Sát nét',
+      customFontAutoFixBtn: 'Tự động căn chỉnh (Auto-Fix)',
+      customFontAutoFixRunning: 'Đang phân tích...',
+      customFontAutoFixUndo: 'Hoàn tác',
+      customFontAutoFixOverlap: 'Phát hiện cặp "ca" chồng nét, đã chỉnh Khoảng cách chữ thành {value}.',
+      customFontAutoFixTight: 'Phát hiện cặp "ca" quá sát, đã chỉnh Khoảng cách chữ thành {value}.',
+      customFontAutoFixWide: 'Phát hiện cặp "ca" quá thưa, đã thu gọn Khoảng cách chữ thành {value}.',
+      customFontAutoFixBalanced: 'Đã phân tích cặp "ca": khoảng cách mặc định đã cân đối ({value}).',
+      customFontLigatureTitle: 'Nối nét nâng cao (Advanced Ligature)',
+      customFontLigatureHint: 'Đặt tỷ lệ chồng nét (Join Overlap %) cho từng cặp chữ: số dương (+%) kéo nét nối liền, số âm (-%) giãn cách.',
+      customFontLigaturePairPlaceholder: 'Cặp chữ (vd: br, st)',
+      customFontLigatureAddPair: 'Thêm cặp',
+      customFontLigaturePresetsLabel: 'Cặp phổ biến',
+      customFontLigatureJoinOverlap: 'Độ chồng nét (Join Overlap)',
+      customFontLigatureClearAll: 'Xóa tất cả',
+      customFontLigatureEmpty: 'Chưa có quy tắc nối nét riêng. Chọn cặp gợi ý phía trên hoặc nhập 2 ký tự bất kỳ.',
+      customFontLigatureActiveCount: 'quy tắc',
+      customFontLigatureRemoveRule: 'Xóa quy tắc cặp chữ',
       fontSizeLabel: 'Cỡ chữ',
       fontSizeSmall: 'Nhỏ (1 ô ly)',
       fontSizeNormal: 'Thường (2 ô ly · Gấp đôi)',

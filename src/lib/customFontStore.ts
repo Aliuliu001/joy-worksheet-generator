@@ -14,6 +14,8 @@ interface StoredCustomFontRecord {
   buffer: ArrayBuffer;
   scale: number;
   baselineOffset: number;
+  letterSpacing?: number;
+  ligatureOverlaps?: Record<string, number>;
   uploadedAt: string;
 }
 
@@ -28,6 +30,53 @@ export function clampCustomScale(value: number): number {
 export function clampBaselineOffset(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(-0.5, Math.min(0.5, Math.round(value * 100) / 100));
+}
+
+export function clampLetterSpacing(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(-0.12, Math.min(0.35, Math.round(value * 100) / 100));
+}
+
+export function clampLigatureOverlap(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(-30, Math.min(40, Math.round(value)));
+}
+
+export function normalizeLigaturePairKey(raw: string): string | null {
+  const compact = String(raw || '').replace(/\s+/g, '').toLowerCase();
+  const chars = Array.from(compact);
+  if (chars.length < 2) return null;
+  return `${chars[0]}${chars[1]}`;
+}
+
+export function sanitizeLigatureOverlaps(input: unknown): Record<string, number> {
+  if (!input || typeof input !== 'object') return {};
+  const out: Record<string, number> = {};
+  for (const [rawKey, rawVal] of Object.entries(input as Record<string, unknown>)) {
+    const key = normalizeLigaturePairKey(rawKey);
+    if (!key) continue;
+    const num = typeof rawVal === 'number' ? rawVal : Number(rawVal);
+    if (!Number.isFinite(num)) continue;
+    out[key] = clampLigatureOverlap(num);
+  }
+  return out;
+}
+
+export function hasActiveLigatureOverlaps(overlaps?: Record<string, number> | null): boolean {
+  if (!overlaps) return false;
+  for (const val of Object.values(overlaps)) {
+    if (typeof val === 'number' && Math.abs(val) >= 0.5) return true;
+  }
+  return false;
+}
+
+export function serializeLigatureOverlapsKey(overlaps?: Record<string, number> | null): string {
+  if (!overlaps) return '';
+  return Object.entries(overlaps)
+    .filter(([, v]) => typeof v === 'number' && Math.abs(v) >= 0.5)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}:${Math.round(v)}`)
+    .join(',');
 }
 
 function openFontDb(): Promise<IDBDatabase | null> {
@@ -158,6 +207,8 @@ export async function loadStoredCustomFonts(): Promise<CustomFontAsset[]> {
       bytes,
       scale: clampCustomScale(rec.scale ?? 1),
       baselineOffset: clampBaselineOffset(rec.baselineOffset ?? 0),
+      letterSpacing: clampLetterSpacing(rec.letterSpacing ?? 0),
+      ligatureOverlaps: sanitizeLigatureOverlaps(rec.ligatureOverlaps),
       uploadedAt: rec.uploadedAt || new Date().toISOString(),
     };
     try {
@@ -184,6 +235,8 @@ async function persistCustomFontRecord(asset: CustomFontAsset): Promise<void> {
     buffer: toArrayBufferCopy(asset.bytes),
     scale: asset.scale,
     baselineOffset: asset.baselineOffset,
+    letterSpacing: asset.letterSpacing,
+    ligatureOverlaps: sanitizeLigatureOverlaps(asset.ligatureOverlaps),
     uploadedAt: asset.uploadedAt,
   };
   await new Promise<void>((resolve) => {
@@ -228,6 +281,8 @@ export async function addCustomFontFile(file: File): Promise<CustomFontAsset> {
     bytes,
     scale: 1,
     baselineOffset: 0,
+    letterSpacing: 0,
+    ligatureOverlaps: {},
     uploadedAt: new Date().toISOString(),
   };
 
@@ -245,7 +300,9 @@ export async function addCustomFontFile(file: File): Promise<CustomFontAsset> {
 export async function updateCustomFontCalibration(
   id: string,
   scale: number,
-  baselineOffset: number
+  baselineOffset: number,
+  letterSpacing = 0,
+  ligatureOverlaps?: Record<string, number>
 ): Promise<CustomFontAsset | null> {
   const existing = fontRegistry.get(id);
   if (!existing) return null;
@@ -253,6 +310,11 @@ export async function updateCustomFontCalibration(
     ...existing,
     scale: clampCustomScale(scale),
     baselineOffset: clampBaselineOffset(baselineOffset),
+    letterSpacing: clampLetterSpacing(letterSpacing),
+    ligatureOverlaps:
+      ligatureOverlaps !== undefined
+        ? sanitizeLigatureOverlaps(ligatureOverlaps)
+        : existing.ligatureOverlaps,
   };
   fontRegistry.set(id, updated);
   await persistCustomFontRecord(updated);

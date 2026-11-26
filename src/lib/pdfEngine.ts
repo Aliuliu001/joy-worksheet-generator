@@ -1,6 +1,6 @@
 import fontkit from '@pdf-lib/fontkit';
 import JSZip from 'jszip';
-import { PDFDocument, PDFFont, PDFImage, PDFPage, StandardFonts, rgb } from 'pdf-lib';
+import { PDFDocument, PDFFont, PDFImage, PDFPage, RGB, StandardFonts, rgb } from 'pdf-lib';
 import {
   DifficultyLevel,
   GridBlockCount,
@@ -45,9 +45,12 @@ import {
 import {
   clampBaselineOffset,
   clampCustomScale,
+  clampLetterSpacing,
   ensureCustomFontFaceLoaded,
   getCustomFontById,
   getCustomFontFamily,
+  hasActiveLigatureOverlaps,
+  sanitizeLigatureOverlaps,
 } from './customFontStore';
 
 const WORKSHEET_LEFT = mm(10);
@@ -244,6 +247,133 @@ function fitRect(
   };
 }
 
+type GraphemeSegmenter = { segment(input: string): Iterable<{ segment: string }> };
+const graphemeSegmenter: GraphemeSegmenter | null =
+  typeof Intl !== 'undefined' && 'Segmenter' in Intl
+    ? new (Intl as unknown as {
+        Segmenter: new (locale: string | undefined, opts: { granularity: 'grapheme' }) => GraphemeSegmenter;
+      }).Segmenter(undefined, { granularity: 'grapheme' })
+    : null;
+
+function splitGraphemes(text: string): string[] {
+  if (!text) return [];
+  if (graphemeSegmenter) {
+    const out: string[] = [];
+    for (const seg of graphemeSegmenter.segment(text)) {
+      out.push(seg.segment);
+    }
+    return out;
+  }
+  const chars = Array.from(text);
+  const out: string[] = [];
+  for (const ch of chars) {
+    if (out.length > 0 && /[\u0300-\u036f]/.test(ch)) {
+      out[out.length - 1] += ch;
+    } else {
+      out.push(ch);
+    }
+  }
+  return out;
+}
+
+type TextSpacingSpec =
+  | number
+  | {
+      letterSpacingEm: number;
+      ligatureOverlaps?: Record<string, number>;
+    };
+
+function unpackTextSpacing(spec: TextSpacingSpec): {
+  letterSpacingEm: number;
+  ligatureOverlaps?: Record<string, number>;
+  hasLigatures: boolean;
+} {
+  if (typeof spec === 'number') {
+    return { letterSpacingEm: spec, hasLigatures: false };
+  }
+  const ligs = spec.ligatureOverlaps;
+  return {
+    letterSpacingEm: spec.letterSpacingEm || 0,
+    ligatureOverlaps: ligs,
+    hasLigatures: hasActiveLigatureOverlaps(ligs),
+  };
+}
+
+function measurePdfTextSpaced(
+  font: PDFFont,
+  text: string,
+  size: number,
+  spacing: TextSpacingSpec = 0
+): number {
+  if (!text) return 0;
+  const { letterSpacingEm, ligatureOverlaps, hasLigatures } = unpackTextSpacing(spacing);
+  if ((Math.abs(letterSpacingEm) < 0.001 && !hasLigatures) || text.length <= 1) {
+    return font.widthOfTextAtSize(text, size);
+  }
+  const parts = splitGraphemes(text);
+  if (parts.length <= 1) return font.widthOfTextAtSize(text, size);
+  const extra = letterSpacingEm * size;
+  let total = 0;
+  for (let i = 0; i < parts.length; i += 1) {
+    const ch = parts[i];
+    const w = font.widthOfTextAtSize(ch, size);
+    total += w;
+    if (i < parts.length - 1) {
+      total += extra;
+      if (hasLigatures && ligatureOverlaps) {
+        const pairKey = `${ch}${parts[i + 1]}`.toLowerCase();
+        const overlapPct = ligatureOverlaps[pairKey] || 0;
+        if (overlapPct !== 0) {
+          total -= (overlapPct / 100) * w;
+        }
+      }
+    }
+  }
+  return Math.max(0, total);
+}
+
+function drawPdfTextSpaced(
+  page: PDFPage,
+  text: string,
+  x: number,
+  y: number,
+  font: PDFFont,
+  size: number,
+  color: RGB,
+  spacing: TextSpacingSpec = 0
+): number {
+  if (!text) return 0;
+  const { letterSpacingEm, ligatureOverlaps, hasLigatures } = unpackTextSpacing(spacing);
+  if ((Math.abs(letterSpacingEm) < 0.001 && !hasLigatures) || text.length <= 1) {
+    page.drawText(text, { x, y, size, font, color });
+    return font.widthOfTextAtSize(text, size);
+  }
+  const parts = splitGraphemes(text);
+  if (parts.length <= 1) {
+    page.drawText(text, { x, y, size, font, color });
+    return font.widthOfTextAtSize(text, size);
+  }
+  const extra = letterSpacingEm * size;
+  let cursorX = x;
+  for (let i = 0; i < parts.length; i += 1) {
+    const ch = parts[i];
+    const w = font.widthOfTextAtSize(ch, size);
+    page.drawText(ch, { x: cursorX, y, size, font, color });
+    cursorX += w;
+    if (i < parts.length - 1) {
+      cursorX += extra;
+      if (hasLigatures && ligatureOverlaps) {
+        const pairKey = `${ch}${parts[i + 1]}`.toLowerCase();
+        const overlapPct = ligatureOverlaps[pairKey] || 0;
+        if (overlapPct !== 0) {
+          cursorX -= (overlapPct / 100) * w;
+        }
+      }
+    }
+  }
+  return Math.max(0, cursorX - x);
+}
+
 function fitTextWidth(
   measure: (t: string, size: number) => number,
   text: string,
@@ -345,6 +475,8 @@ export interface GuidelineOverlayOptions {
   customFontId?: string | null;
   customFontScale?: number;
   customFontBaselineOffset?: number;
+  customFontLetterSpacing?: number;
+  customFontLigatureOverlaps?: Record<string, number>;
 }
 
 const DEFAULT_OVERLAY: GuidelineOverlayOptions = {
@@ -354,6 +486,8 @@ const DEFAULT_OVERLAY: GuidelineOverlayOptions = {
   customFontId: null,
   customFontScale: 1,
   customFontBaselineOffset: 0,
+  customFontLetterSpacing: 0,
+  customFontLigatureOverlaps: {},
 };
 
 interface CustomCalibration {
@@ -361,23 +495,37 @@ interface CustomCalibration {
   scaleMult: number;
   offsetCells: number;
   nonGridShiftPt: number;
+  letterSpacingEm: number;
+  ligatureOverlaps: Record<string, number>;
 }
 
 function resolveCustomCalibration(
   fontStyle: WorksheetFontStyle,
   scale?: number,
-  baselineOffset?: number
+  baselineOffset?: number,
+  letterSpacing?: number,
+  ligatureOverlaps?: Record<string, number>
 ): CustomCalibration {
   if (fontStyle !== 'custom') {
-    return { isCustom: false, scaleMult: 1, offsetCells: 0, nonGridShiftPt: 0 };
+    return {
+      isCustom: false,
+      scaleMult: 1,
+      offsetCells: 0,
+      nonGridShiftPt: 0,
+      letterSpacingEm: 0,
+      ligatureOverlaps: {},
+    };
   }
   const scaleMult = clampCustomScale(scale ?? 1);
   const offsetCells = clampBaselineOffset(baselineOffset ?? 0);
+  const letterSpacingEm = clampLetterSpacing(letterSpacing ?? 0);
   return {
     isCustom: true,
     scaleMult,
     offsetCells,
     nonGridShiftPt: offsetCells * mm(2.2),
+    letterSpacingEm,
+    ligatureOverlaps: sanitizeLigatureOverlaps(ligatureOverlaps),
   };
 }
 
@@ -521,7 +669,13 @@ export async function makeFlashcardsPdf(
   const cellW = (PAGE_A5[0] - FLASHCARD_MARGIN * 2) / FLASHCARD_COLS;
   const cellH = (PAGE_A5[1] - FLASHCARD_MARGIN * 2) / FLASHCARD_ROWS;
   const useViet = fontStyle === 'viet-primary';
-  const customCal = resolveCustomCalibration(fontStyle, overlay.customFontScale, overlay.customFontBaselineOffset);
+  const customCal = resolveCustomCalibration(
+    fontStyle,
+    overlay.customFontScale,
+    overlay.customFontBaselineOffset,
+    overlay.customFontLetterSpacing,
+    overlay.customFontLigatureOverlaps
+  );
   const useOverlay = (useViet || customCal.isCustom) && overlay.enabled;
 
   for (let start = 0; start < items.length; start += perPage) {
@@ -616,36 +770,42 @@ export async function makeFlashcardsPdf(
             overlay.fontSize
           );
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             item.en,
             maxW - mm(0.8),
             g.unit * 1.92 * customCal.scaleMult,
             5.5
           );
-          const textW = f.widthOfTextAtSize(fitted.text, fitted.size);
-          page.drawText(fitted.text, {
-            x: x + (cellW - textW) / 2,
-            y: g.baselineY + customCal.offsetCells * g.unit,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.08, 0.1, 0.15),
-          });
+          const textW = measurePdfTextSpaced(f, fitted.text, fitted.size, customCal);
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            x + (cellW - textW) / 2,
+            g.baselineY + customCal.offsetCells * g.unit,
+            f,
+            fitted.size,
+            rgb(0.08, 0.1, 0.15),
+            customCal
+          );
         } else {
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             item.en,
             cellW - mm(2.2),
             11.5 * profile.fontScale * standardTextMultiplier(overlay.fontSize) * customCal.scaleMult,
             6.5
           );
-          const textW = f.widthOfTextAtSize(fitted.text, fitted.size);
-          page.drawText(fitted.text, {
-            x: x + (cellW - textW) / 2,
-            y: bottomY + mm(2.1) + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.08, 0.1, 0.15),
-          });
+          const textW = measurePdfTextSpaced(f, fitted.text, fitted.size, customCal);
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            x + (cellW - textW) / 2,
+            bottomY + mm(2.1) + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            rgb(0.08, 0.1, 0.15),
+            customCal
+          );
         }
       }
     }
@@ -675,7 +835,13 @@ export async function makeAnagramPdf(
   const usableTop = PAGE_A5[1] - WORKSHEET_TOP - WORKSHEET_HEADER_H;
   const rowH = (usableTop - mm(6)) / perPage;
   const useViet = fontStyle === 'viet-primary';
-  const customCal = resolveCustomCalibration(fontStyle, overlay.customFontScale, overlay.customFontBaselineOffset);
+  const customCal = resolveCustomCalibration(
+    fontStyle,
+    overlay.customFontScale,
+    overlay.customFontBaselineOffset,
+    overlay.customFontLetterSpacing,
+    overlay.customFontLigatureOverlaps
+  );
   const useOverlay = (useViet || customCal.isCustom) && overlay.enabled;
 
   for (let start = 0, pageNo = 1; start < entries.length; start += perPage, pageNo += 1) {
@@ -732,19 +898,22 @@ export async function makeAnagramPdf(
       } else {
         const clueFont = safeFontForText(entry.scrambled, penFont, unicodeFont);
         const fittedClue = fitTextWidth(
-          (t, s) => clueFont.widthOfTextAtSize(t, s),
+          (t, s) => measurePdfTextSpaced(clueFont, t, s, customCal),
           entry.scrambled,
           clueMaxW,
           13.5 * profile.fontScale * stdMult * customCal.scaleMult,
           8.5
         );
-        page.drawText(fittedClue.text, {
-          x: clueX,
-          y: baseline + customCal.nonGridShiftPt,
-          size: fittedClue.size,
-          font: clueFont,
-          color: rgb(0.22, 0.27, 0.35),
-        });
+        drawPdfTextSpaced(
+          page,
+          fittedClue.text,
+          clueX,
+          baseline + customCal.nonGridShiftPt,
+          clueFont,
+          fittedClue.size,
+          rgb(0.22, 0.27, 0.35),
+          customCal
+        );
       }
 
       const lineX = clueX + clueMaxW + mm(4);
@@ -778,19 +947,22 @@ export async function makeAnagramPdf(
           if (answer) {
             const ansFont = safeFontForText(entry.item.en, penFont, unicodeFont);
             const fittedAns = fitTextWidth(
-              (t, s) => ansFont.widthOfTextAtSize(t, s),
+              (t, s) => measurePdfTextSpaced(ansFont, t, s, customCal),
               entry.item.en,
               ansW - g.gridUnit * 0.8,
               g.unit * 1.92 * customCal.scaleMult,
               7.5
             );
-            page.drawText(fittedAns.text, {
-              x: lineX + g.gridUnit * 0.4,
-              y: g.baselineY + customCal.offsetCells * g.unit,
-              size: fittedAns.size,
-              font: ansFont,
-              color: rgb(0.11, 0.31, 0.78),
-            });
+            drawPdfTextSpaced(
+              page,
+              fittedAns.text,
+              lineX + g.gridUnit * 0.4,
+              g.baselineY + customCal.offsetCells * g.unit,
+              ansFont,
+              fittedAns.size,
+              rgb(0.11, 0.31, 0.78),
+              customCal
+            );
           } else if (profile.revealFirstLetter && entry.item.en.trim().length > 0) {
             const firstChar = entry.item.en.trim()[0];
             const hintFont = safeFontForText(firstChar, penFont, unicodeFont);
@@ -813,19 +985,22 @@ export async function makeAnagramPdf(
         } else {
           const ansFont = safeFontForText(entry.item.en, penFont, unicodeFont);
           const fittedAns = fitTextWidth(
-            (t, s) => ansFont.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(ansFont, t, s, customCal),
             entry.item.en,
             ansW,
             13.5 * profile.fontScale * stdMult * customCal.scaleMult,
             8.5
           );
-          page.drawText(fittedAns.text, {
-            x: lineX,
-            y: baseline + customCal.nonGridShiftPt,
-            size: fittedAns.size,
-            font: ansFont,
-            color: rgb(0.11, 0.31, 0.78),
-          });
+          drawPdfTextSpaced(
+            page,
+            fittedAns.text,
+            lineX,
+            baseline + customCal.nonGridShiftPt,
+            ansFont,
+            fittedAns.size,
+            rgb(0.11, 0.31, 0.78),
+            customCal
+          );
         }
       } else {
         let drawLineStart = lineX;
@@ -902,7 +1077,13 @@ export async function makeWordScramblePdf(
   const usableH = headerBottomY - mm(10);
   const rowH = usableH / perPage;
   const useViet = fontStyle === 'viet-primary';
-  const customCal = resolveCustomCalibration(fontStyle, overlay.customFontScale, overlay.customFontBaselineOffset);
+  const customCal = resolveCustomCalibration(
+    fontStyle,
+    overlay.customFontScale,
+    overlay.customFontBaselineOffset,
+    overlay.customFontLetterSpacing,
+    overlay.customFontLigatureOverlaps
+  );
   const useOverlay = (useViet || customCal.isCustom) && overlay.enabled;
 
   const tilesStartX = left + mm(9);
@@ -1088,19 +1269,22 @@ export async function makeWordScramblePdf(
           if (answer) {
             const f = safeFontForText(entry.item.en, penFont, unicodeFont);
             const fitted = fitTextWidth(
-              (t, s) => f.widthOfTextAtSize(t, s),
+              (t, s) => measurePdfTextSpaced(f, t, s, customCal),
               entry.item.en,
               ansMaxW - g.gridUnit * 0.8,
               g.unit * 1.92 * customCal.scaleMult,
               7.5
             );
-            page.drawText(fitted.text, {
-              x: ansX + g.gridUnit * 0.4,
-              y: g.baselineY + customCal.offsetCells * g.unit,
-              size: fitted.size,
-              font: f,
-              color: rgb(0.11, 0.31, 0.78),
-            });
+            drawPdfTextSpaced(
+              page,
+              fitted.text,
+              ansX + g.gridUnit * 0.4,
+              g.baselineY + customCal.offsetCells * g.unit,
+              f,
+              fitted.size,
+              rgb(0.11, 0.31, 0.78),
+              customCal
+            );
           } else if (profile.revealFirstLetter && entry.item.en.trim().length > 0) {
             const firstChar = entry.item.en.trim()[0];
             const f = safeFontForText(firstChar, penFont, unicodeFont);
@@ -1128,19 +1312,22 @@ export async function makeWordScramblePdf(
         } else {
           const f = safeFontForText(entry.item.en, penFont, unicodeFont);
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             entry.item.en,
             ansMaxW,
             13 * profile.fontScale * standardTextMultiplier(overlay.fontSize) * customCal.scaleMult,
             8
           );
-          page.drawText(fitted.text, {
-            x: ansX,
-            y: centerY - 3.5 + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.11, 0.31, 0.78),
-          });
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            ansX,
+            centerY - 3.5 + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            rgb(0.11, 0.31, 0.78),
+            customCal
+          );
         }
         page.drawLine({
           start: { x: ansX, y: centerY - mm(2.6) },
@@ -1235,7 +1422,13 @@ export async function makeMatching1Pdf(
   const usableH = PAGE_A5[1] - WORKSHEET_TOP - WORKSHEET_HEADER_H - WORKSHEET_BOTTOM;
   const rowH = usableH / 6;
   const useViet = fontStyle === 'viet-primary';
-  const customCal = resolveCustomCalibration(fontStyle, overlay.customFontScale, overlay.customFontBaselineOffset);
+  const customCal = resolveCustomCalibration(
+    fontStyle,
+    overlay.customFontScale,
+    overlay.customFontBaselineOffset,
+    overlay.customFontLetterSpacing,
+    overlay.customFontLigatureOverlaps
+  );
   const useOverlay = (useViet || customCal.isCustom) && overlay.enabled;
 
   for (let groupIdx = 0; groupIdx < orders.length; groupIdx += 1) {
@@ -1353,36 +1546,42 @@ export async function makeMatching1Pdf(
           });
           const f = safeFontForText(term.item.en, penFont, unicodeFont);
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             term.item.en,
             wordMaxW - mm(1),
             g.unit * 1.92 * customCal.scaleMult,
             7.5
           );
-          page.drawText(fitted.text, {
-            x: wordX + g.gridUnit * 0.35,
-            y: g.baselineY + customCal.offsetCells * g.unit,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.1, 0.12, 0.18),
-          });
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            wordX + g.gridUnit * 0.35,
+            g.baselineY + customCal.offsetCells * g.unit,
+            f,
+            fitted.size,
+            rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         } else {
           const label = `${term.letter}. ${term.item.en}`;
           const f = safeFontForText(label, penFont, unicodeFont);
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             label,
             right - termX,
             14 * standardTextMultiplier(overlay.fontSize) * customCal.scaleMult,
             8.5
           );
-          page.drawText(fitted.text, {
-            x: termX,
-            y: centerY - 4 + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.1, 0.12, 0.18),
-          });
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            termX,
+            centerY - 4 + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         }
       }
 
@@ -1436,7 +1635,13 @@ export async function makeMatching2Pdf(
   const cardW = (matching2Width() - MATCHING2_LAYOUT.cardGap * 4) / 5;
   const cols = matching2Columns();
   const useViet = fontStyle === 'viet-primary';
-  const customCal = resolveCustomCalibration(fontStyle, overlay.customFontScale, overlay.customFontBaselineOffset);
+  const customCal = resolveCustomCalibration(
+    fontStyle,
+    overlay.customFontScale,
+    overlay.customFontBaselineOffset,
+    overlay.customFontLetterSpacing,
+    overlay.customFontLigatureOverlaps
+  );
   const useOverlay = (useViet || customCal.isCustom) && overlay.enabled;
 
   for (let pageIdx = 0; pageIdx < pages.length; pageIdx += 1) {
@@ -1576,36 +1781,42 @@ export async function makeMatching2Pdf(
           });
           const f = safeFontForText(item.en, penFont, unicodeFont);
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             item.en,
             wordW - mm(0.6),
             g.unit * 1.92 * customCal.scaleMult,
             5.5
           );
-          page.drawText(fitted.text, {
-            x: wordX + g.gridUnit * 0.25,
-            y: g.baselineY + customCal.offsetCells * g.unit,
-            size: fitted.size,
-            font: f,
-            color: answer ? rgb(0.11, 0.31, 0.78) : rgb(0.1, 0.12, 0.18),
-          });
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            wordX + g.gridUnit * 0.25,
+            g.baselineY + customCal.offsetCells * g.unit,
+            f,
+            fitted.size,
+            answer ? rgb(0.11, 0.31, 0.78) : rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         } else {
           const prompt = answer ? `${pIdx + 1}. [${letter}] ${item.en}` : `${pIdx + 1}. ____ ${item.en}`;
           const f = safeFontForText(prompt, penFont, unicodeFont);
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             prompt,
             col.width - mm(1.5),
             MATCHING2_LAYOUT.promptSize * standardTextMultiplier(overlay.fontSize) * customCal.scaleMult,
             MATCHING2_LAYOUT.promptMinSize
           );
-          page.drawText(fitted.text, {
-            x: col.start,
-            y: baselineY + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: answer ? rgb(0.11, 0.31, 0.78) : rgb(0.1, 0.12, 0.18),
-          });
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            col.start,
+            baselineY + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            answer ? rgb(0.11, 0.31, 0.78) : rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         }
       }
 
@@ -1639,7 +1850,13 @@ export async function makeMatching3Pdf(
   const usableH = PAGE_A5[1] - WORKSHEET_TOP - WORKSHEET_HEADER_H - WORKSHEET_BOTTOM;
   const rowH = usableH / Math.max(plan.items.length, 6);
   const useViet = fontStyle === 'viet-primary';
-  const customCal = resolveCustomCalibration(fontStyle, overlay.customFontScale, overlay.customFontBaselineOffset);
+  const customCal = resolveCustomCalibration(
+    fontStyle,
+    overlay.customFontScale,
+    overlay.customFontBaselineOffset,
+    overlay.customFontLetterSpacing,
+    overlay.customFontLigatureOverlaps
+  );
   const useOverlay = (useViet || customCal.isCustom) && overlay.enabled;
 
   if (plan.twoUp) {
@@ -1764,36 +1981,42 @@ export async function makeMatching3Pdf(
           });
           const f = safeFontForText(term.item.en, penFont, unicodeFont);
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             term.item.en,
             wordMaxW - mm(0.8),
             g.unit * 1.92 * customCal.scaleMult,
             7.2
           );
-          page.drawText(fitted.text, {
-            x: wordX + g.gridUnit * 0.3,
-            y: g.baselineY + customCal.offsetCells * g.unit,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.1, 0.12, 0.18),
-          });
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            wordX + g.gridUnit * 0.3,
+            g.baselineY + customCal.offsetCells * g.unit,
+            f,
+            fitted.size,
+            rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         } else {
           const label = `${term.letter}. ${term.item.en}`;
           const f = safeFontForText(label, penFont, unicodeFont);
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             label,
             right - termX,
             12.5 * standardTextMultiplier(overlay.fontSize) * customCal.scaleMult,
             8
           );
-          page.drawText(fitted.text, {
-            x: termX,
-            y: centerY - 3.5 + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.1, 0.12, 0.18),
-          });
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            termX,
+            centerY - 3.5 + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         }
       }
 
@@ -1910,6 +2133,8 @@ export interface Typing1Options {
   customFontId?: string | null;
   customFontScale?: number;
   customFontBaselineOffset?: number;
+  customFontLetterSpacing?: number;
+  customFontLigatureOverlaps?: Record<string, number>;
 }
 
 export async function makeTyping1Pdf(
@@ -1929,6 +2154,8 @@ export async function makeTyping1Pdf(
     customFontId: null,
     customFontScale: 1,
     customFontBaselineOffset: 0,
+    customFontLetterSpacing: 0,
+    customFontLigatureOverlaps: {},
   },
   difficulty: DifficultyLevel = 'intermediate'
 ): Promise<Uint8Array> {
@@ -1943,7 +2170,9 @@ export async function makeTyping1Pdf(
   const customCal = resolveCustomCalibration(
     fontStyle,
     options.customFontScale,
-    options.customFontBaselineOffset
+    options.customFontBaselineOffset,
+    options.customFontLetterSpacing,
+    options.customFontLigatureOverlaps
   );
 
   if (options.gridlines) {
@@ -2061,7 +2290,7 @@ export async function makeTyping1Pdf(
             );
           } else {
             const fittedSample = fitTextWidth(
-              (t, s) => f.widthOfTextAtSize(t, s),
+              (t, s) => measurePdfTextSpaced(f, t, s, customCal),
               item.en,
               gridWidth * (textScale === 2 ? 0.64 : 0.44),
               gridFontSize,
@@ -2069,14 +2298,16 @@ export async function makeTyping1Pdf(
             );
             fittedSampleText = fittedSample.text;
             fittedSampleSize = fittedSample.size;
-            sampleW = f.widthOfTextAtSize(fittedSampleText, fittedSampleSize);
-            page.drawText(fittedSampleText, {
-              x: sampleStartX,
-              y: baselineY + gridBaselineShift,
-              size: fittedSampleSize,
-              font: f,
-              color: rgb(0.16, 0.22, 0.32),
-            });
+            sampleW = drawPdfTextSpaced(
+              page,
+              fittedSampleText,
+              sampleStartX,
+              baselineY + gridBaselineShift,
+              f,
+              fittedSampleSize,
+              rgb(0.16, 0.22, 0.32),
+              customCal
+            );
           }
 
           // Snap separator to next clean vertical grid line after sample word
@@ -2110,13 +2341,16 @@ export async function makeTyping1Pdf(
                 }
               );
             } else {
-              page.drawText(fittedSampleText, {
-                x: practiceStartX,
-                y: baselineY + gridBaselineShift,
-                size: fittedSampleSize,
-                font: f,
-                color: rgb(0.76, 0.81, 0.87),
-              });
+              drawPdfTextSpaced(
+                page,
+                fittedSampleText,
+                practiceStartX,
+                baselineY + gridBaselineShift,
+                f,
+                fittedSampleSize,
+                rgb(0.76, 0.81, 0.87),
+                customCal
+              );
             }
             const nextCols = Math.ceil((practiceStartX + sampleW - gridX) / gridUnit) + 2;
             practiceStartX = gridX + nextCols * gridUnit;
@@ -2144,19 +2378,22 @@ export async function makeTyping1Pdf(
             );
           } else {
             const fittedAns = fitTextWidth(
-              (t, s) => f.widthOfTextAtSize(t, s),
+              (t, s) => measurePdfTextSpaced(f, t, s, customCal),
               item.en,
               gridRight - practiceStartX - gridUnit * 0.5,
               gridFontSize,
               7.8
             );
-            page.drawText(fittedAns.text, {
-              x: practiceStartX,
-              y: baselineY + gridBaselineShift,
-              size: fittedAns.size,
-              font: f,
-              color: rgb(0.11, 0.31, 0.78),
-            });
+            drawPdfTextSpaced(
+              page,
+              fittedAns.text,
+              practiceStartX,
+              baselineY + gridBaselineShift,
+              f,
+              fittedAns.size,
+              rgb(0.11, 0.31, 0.78),
+              customCal
+            );
           }
         }
       }
@@ -2261,20 +2498,23 @@ export async function makeTyping1Pdf(
           if (options.showSample && !answer) {
             const sampleMaxW = (areaRight - cursorX) * 0.48;
             const fittedSample = fitTextWidth(
-              (t, s) => f.widthOfTextAtSize(t, s),
+              (t, s) => measurePdfTextSpaced(f, t, s, customCal),
               item.en,
               sampleMaxW,
               customOverlaySize,
               6.5
             );
-            page.drawText(fittedSample.text, {
-              x: cursorX,
-              y: customOverlayY,
-              size: fittedSample.size,
-              font: f,
-              color: rgb(0.35, 0.42, 0.52),
-            });
-            cursorX += f.widthOfTextAtSize(fittedSample.text, fittedSample.size) + mm(2.2);
+            const sw = drawPdfTextSpaced(
+              page,
+              fittedSample.text,
+              cursorX,
+              customOverlayY,
+              f,
+              fittedSample.size,
+              rgb(0.35, 0.42, 0.52),
+              customCal
+            );
+            cursorX += sw + mm(2.2);
           } else if (!answer && profile.revealFirstLetter && item.en.trim().length > 0) {
             page.drawText(item.en.trim()[0], {
               x: cursorX,
@@ -2286,19 +2526,22 @@ export async function makeTyping1Pdf(
           }
           if (answer) {
             const fittedAns = fitTextWidth(
-              (t, s) => f.widthOfTextAtSize(t, s),
+              (t, s) => measurePdfTextSpaced(f, t, s, customCal),
               item.en,
               areaRight - cursorX - g.gridUnit * 0.3,
               customOverlaySize,
               6.5
             );
-            page.drawText(fittedAns.text, {
-              x: cursorX,
-              y: customOverlayY,
-              size: fittedAns.size,
-              font: f,
-              color: rgb(0.11, 0.31, 0.78),
-            });
+            drawPdfTextSpaced(
+              page,
+              fittedAns.text,
+              cursorX,
+              customOverlayY,
+              f,
+              fittedAns.size,
+              rgb(0.11, 0.31, 0.78),
+              customCal
+            );
           }
         }
         continue;
@@ -2315,20 +2558,22 @@ export async function makeTyping1Pdf(
           lineStart += sw + mm(2.2);
         } else {
           const fittedSample = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             item.en,
             sampleMaxW,
             10.5 * profile.fontScale * stdMult * customCal.scaleMult,
             6.8
           );
-          const sampleW = f.widthOfTextAtSize(fittedSample.text, fittedSample.size);
-          page.drawText(fittedSample.text, {
-            x: lineStart,
-            y: writingLineY + mm(1) + customCal.nonGridShiftPt,
-            size: fittedSample.size,
-            font: f,
-            color: rgb(0.42, 0.48, 0.56),
-          });
+          const sampleW = drawPdfTextSpaced(
+            page,
+            fittedSample.text,
+            lineStart,
+            writingLineY + mm(1) + customCal.nonGridShiftPt,
+            f,
+            fittedSample.size,
+            rgb(0.42, 0.48, 0.56),
+            customCal
+          );
           lineStart += sampleW + mm(2.2);
         }
       } else if (!answer && profile.revealFirstLetter && item.en.trim().length > 0) {
@@ -2361,19 +2606,22 @@ export async function makeTyping1Pdf(
           });
         } else {
           const fitted = fitTextWidth(
-            (t, s) => f.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(f, t, s, customCal),
             item.en,
             areaRight - lineStart,
             11.5 * profile.fontScale * stdMult * customCal.scaleMult,
             7
           );
-          page.drawText(fitted.text, {
-            x: lineStart,
-            y: writingLineY + mm(1) + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.11, 0.31, 0.78),
-          });
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            lineStart,
+            writingLineY + mm(1) + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            rgb(0.11, 0.31, 0.78),
+            customCal
+          );
         }
       } else if (lineStart < areaRight - mm(4)) {
         page.drawLine({
@@ -2413,7 +2661,13 @@ export async function makeVocabularyCheckPdf(
   const promptW = (panelW - numW) * 0.46;
   const answerW = panelW - numW - promptW;
   const useViet = fontStyle === 'viet-primary';
-  const customCal = resolveCustomCalibration(fontStyle, overlay.customFontScale, overlay.customFontBaselineOffset);
+  const customCal = resolveCustomCalibration(
+    fontStyle,
+    overlay.customFontScale,
+    overlay.customFontBaselineOffset,
+    overlay.customFontLetterSpacing,
+    overlay.customFontLigatureOverlaps
+  );
   const useOverlay = (useViet || customCal.isCustom) && overlay.enabled;
 
   for (let start = 0, pageNo = 1; start < items.length; start += VOCAB_ROWS_PER_PAGE, pageNo += 1) {
@@ -2541,19 +2795,22 @@ export async function makeVocabularyCheckPdf(
         } else {
           const pFont = customCal.isCustom ? safeFontForText(promptText, penFont, unicodeFont) : unicodeFont;
           const fittedPrompt = fitTextWidth(
-            (t, s) => pFont.widthOfTextAtSize(t, s),
+            (t, s) => measurePdfTextSpaced(pFont, t, s, customCal),
             promptText,
             promptW - mm(2.5),
             fontSize * customCal.scaleMult,
             6.2
           );
-          page.drawText(fittedPrompt.text, {
-            x: px + numW + mm(1.3),
-            y: y + customCal.nonGridShiftPt,
-            size: fittedPrompt.size,
-            font: pFont,
-            color: rgb(0.08, 0.1, 0.15),
-          });
+          drawPdfTextSpaced(
+            page,
+            fittedPrompt.text,
+            px + numW + mm(1.3),
+            y + customCal.nonGridShiftPt,
+            pFont,
+            fittedPrompt.size,
+            rgb(0.08, 0.1, 0.15),
+            customCal
+          );
         }
 
         const ansText = mode === 'vi-to-en' ? item.en : item.vi;
@@ -2587,19 +2844,22 @@ export async function makeVocabularyCheckPdf(
             const aFont = safeFontForText(ansText, penFont, unicodeFont);
             if (answer) {
               const fittedAns = fitTextWidth(
-                (t, s) => aFont.widthOfTextAtSize(t, s),
+                (t, s) => measurePdfTextSpaced(aFont, t, s, customCal),
                 ansText,
                 answerW - mm(2.4),
                 g.unit * 1.92 * customCal.scaleMult,
                 5.5
               );
-              page.drawText(fittedAns.text, {
-                x: ansCellX + mm(1.2),
-                y: g.baselineY + customCal.offsetCells * g.unit,
-                size: fittedAns.size,
-                font: aFont,
-                color: rgb(0.11, 0.31, 0.78),
-              });
+              drawPdfTextSpaced(
+                page,
+                fittedAns.text,
+                ansCellX + mm(1.2),
+                g.baselineY + customCal.offsetCells * g.unit,
+                aFont,
+                fittedAns.size,
+                rgb(0.11, 0.31, 0.78),
+                customCal
+              );
             } else if (profile.revealFirstLetter && ansText.trim().length > 0) {
               page.drawText(ansText.trim()[0], {
                 x: ansCellX + mm(1.2),
@@ -2620,30 +2880,36 @@ export async function makeVocabularyCheckPdf(
           } else {
             const aFont = customCal.isCustom ? safeFontForText(ansText, penFont, unicodeFont) : unicodeFont;
             const fittedAns = fitTextWidth(
-              (t, s) => aFont.widthOfTextAtSize(t, s),
+              (t, s) => measurePdfTextSpaced(aFont, t, s, customCal),
               ansText,
               answerW - mm(2.5),
               fontSize * customCal.scaleMult,
               6.2
             );
-            page.drawText(fittedAns.text, {
-              x: ansCellX + mm(1.3),
-              y: y + customCal.nonGridShiftPt,
-              size: fittedAns.size,
-              font: aFont,
-              color: rgb(0.11, 0.31, 0.78),
-            });
+            drawPdfTextSpaced(
+              page,
+              fittedAns.text,
+              ansCellX + mm(1.3),
+              y + customCal.nonGridShiftPt,
+              aFont,
+              fittedAns.size,
+              rgb(0.11, 0.31, 0.78),
+              customCal
+            );
           }
         } else if (profile.revealFirstLetter && ansText.trim().length > 0) {
           const cue = `${ansText.trim()[0]}_____`;
           const cueFont = customCal.isCustom ? safeFontForText(cue, penFont, unicodeFont) : unicodeFont;
-          page.drawText(cue, {
-            x: ansCellX + mm(1.3),
-            y: y + customCal.nonGridShiftPt,
-            size: fontSize * 0.92 * customCal.scaleMult,
-            font: cueFont,
-            color: rgb(0.58, 0.64, 0.72),
-          });
+          drawPdfTextSpaced(
+            page,
+            cue,
+            ansCellX + mm(1.3),
+            y + customCal.nonGridShiftPt,
+            cueFont,
+            fontSize * 0.92 * customCal.scaleMult,
+            rgb(0.58, 0.64, 0.72),
+            customCal
+          );
         }
       }
     }
@@ -2668,7 +2934,13 @@ export async function makeMixPdf(
   const cache = new Map<string, PDFImage>();
   const [pageW, pageH] = PAGE_A4_PORTRAIT;
   const useViet = fontStyle === 'viet-primary';
-  const customCal = resolveCustomCalibration(fontStyle, overlay.customFontScale, overlay.customFontBaselineOffset);
+  const customCal = resolveCustomCalibration(
+    fontStyle,
+    overlay.customFontScale,
+    overlay.customFontBaselineOffset,
+    overlay.customFontLetterSpacing,
+    overlay.customFontLigatureOverlaps
+  );
   const useOverlay = (useViet || customCal.isCustom) && overlay.enabled;
 
   for (let pIdx = 0; pIdx < plan.pages.length; pIdx += 1) {
@@ -2741,7 +3013,7 @@ async function drawMixBlockPdf(
   useOverlay = false,
   overlayBlocks: GridBlockCount = 4,
   fontSize: WorksheetFontSize = 'small',
-  customCal: CustomCalibration = { isCustom: false, scaleMult: 1, offsetCells: 0, nonGridShiftPt: 0 }
+  customCal: CustomCalibration = { isCustom: false, scaleMult: 1, offsetCells: 0, nonGridShiftPt: 0, letterSpacingEm: 0, ligatureOverlaps: {} }
 ) {
   const fontFor = (t: string) => safeFontForText(t, preferredFont, fallbackFont);
   const font = fallbackFont;
@@ -2845,25 +3117,31 @@ async function drawMixBlockPdf(
           );
           page.drawText(prefix, { x: rightDotX + mm(5), y: g.baselineY, size: 9.5, font: boldFont, color: rgb(0.15, 0.18, 0.24) });
           const f = fontFor(term.item.en);
-          const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), term.item.en, ww - mm(1), g.unit * 1.92 * customCal.scaleMult, 6.5);
-          page.drawText(fitted.text, {
-            x: wx + g.gridUnit * 0.3,
-            y: g.baselineY + customCal.offsetCells * g.unit,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.1, 0.12, 0.18),
-          });
+          const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), term.item.en, ww - mm(1), g.unit * 1.92 * customCal.scaleMult, 6.5);
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            wx + g.gridUnit * 0.3,
+            g.baselineY + customCal.offsetCells * g.unit,
+            f,
+            fitted.size,
+            rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         } else {
           const label = `${term.letter}. ${term.item.en}`;
           const f = fontFor(label);
-          const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), label, Math.max(mm(20), block.x + block.width - (rightDotX + mm(5))), 10 * stdMult * customCal.scaleMult, 6.5);
-          page.drawText(fitted.text, {
-            x: rightDotX + mm(5),
-            y: centerY - 3 + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.1, 0.12, 0.18),
-          });
+          const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), label, Math.max(mm(20), block.x + block.width - (rightDotX + mm(5))), 10 * stdMult * customCal.scaleMult, 6.5);
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            rightDotX + mm(5),
+            centerY - 3 + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         }
       }
 
@@ -2917,14 +3195,17 @@ async function drawMixBlockPdf(
       } else {
         const clueText = entry?.scrambled || item.en;
         const f = fontFor(clueText);
-        const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), clueText, mm(70), 10.5 * stdMult * customCal.scaleMult, 6.5);
-        page.drawText(fitted.text, {
-          x: block.x + mm(27),
-          y: centerY - 3 + customCal.nonGridShiftPt,
-          size: fitted.size,
-          font: f,
-          color: rgb(0.25, 0.3, 0.38),
-        });
+        const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), clueText, mm(70), 10.5 * stdMult * customCal.scaleMult, 6.5);
+        drawPdfTextSpaced(
+          page,
+          fitted.text,
+          block.x + mm(27),
+          centerY - 3 + customCal.nonGridShiftPt,
+          f,
+          fitted.size,
+          rgb(0.25, 0.3, 0.38),
+          customCal
+        );
       }
 
       const lineX = block.x + mm(102);
@@ -2950,14 +3231,17 @@ async function drawMixBlockPdf(
             });
           } else {
             const f = fontFor(item.en);
-            const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), item.en, ansW - g.gridUnit * 0.8, g.unit * 1.92 * customCal.scaleMult, 6.5);
-            page.drawText(fitted.text, {
-              x: lineX + g.gridUnit * 0.35,
-              y: g.baselineY + customCal.offsetCells * g.unit,
-              size: fitted.size,
-              font: f,
-              color: rgb(0.11, 0.31, 0.78),
-            });
+            const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), item.en, ansW - g.gridUnit * 0.8, g.unit * 1.92 * customCal.scaleMult, 6.5);
+            drawPdfTextSpaced(
+              page,
+              fitted.text,
+              lineX + g.gridUnit * 0.35,
+              g.baselineY + customCal.offsetCells * g.unit,
+              f,
+              fitted.size,
+              rgb(0.11, 0.31, 0.78),
+              customCal
+            );
           }
         }
       } else if (answer) {
@@ -2969,14 +3253,17 @@ async function drawMixBlockPdf(
           });
         } else {
           const f = fontFor(item.en);
-          const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), item.en, ansW, 10.5 * stdMult * customCal.scaleMult, 6.5);
-          page.drawText(fitted.text, {
-            x: lineX,
-            y: centerY - 3 + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.11, 0.31, 0.78),
-          });
+          const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), item.en, ansW, 10.5 * stdMult * customCal.scaleMult, 6.5);
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            lineX,
+            centerY - 3 + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            rgb(0.11, 0.31, 0.78),
+            customCal
+          );
         }
       } else {
         page.drawLine({
@@ -3095,25 +3382,31 @@ async function drawMixBlockPdf(
             color: answer ? rgb(0.11, 0.31, 0.78) : rgb(0.15, 0.18, 0.24),
           });
           const f = fontFor(item.en);
-          const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), item.en, ww - mm(0.6), g.unit * 1.92 * customCal.scaleMult, 5.5);
-          page.drawText(fitted.text, {
-            x: wx + g.gridUnit * 0.25,
-            y: g.baselineY + customCal.offsetCells * g.unit,
-            size: fitted.size,
-            font: f,
-            color: answer ? rgb(0.11, 0.31, 0.78) : rgb(0.1, 0.12, 0.18),
-          });
+          const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), item.en, ww - mm(0.6), g.unit * 1.92 * customCal.scaleMult, 5.5);
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            wx + g.gridUnit * 0.25,
+            g.baselineY + customCal.offsetCells * g.unit,
+            f,
+            fitted.size,
+            answer ? rgb(0.11, 0.31, 0.78) : rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         } else {
           const text = answer ? `${pIdx + 1}. [${letter}] ${item.en}` : `${pIdx + 1}. ____ ${item.en}`;
           const f = fontFor(text);
-          const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), text, colW - mm(2), 10 * stdMult * customCal.scaleMult, 6.5);
-          page.drawText(fitted.text, {
-            x: px,
-            y: py + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: answer ? rgb(0.11, 0.31, 0.78) : rgb(0.1, 0.12, 0.18),
-          });
+          const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), text, colW - mm(2), 10 * stdMult * customCal.scaleMult, 6.5);
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            px,
+            py + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            answer ? rgb(0.11, 0.31, 0.78) : rgb(0.1, 0.12, 0.18),
+            customCal
+          );
         }
       }
       cursorTop += group.height + MIX_MATCHING2.groupGap;
@@ -3171,14 +3464,17 @@ async function drawMixBlockPdf(
             });
           } else {
             const f = fontFor(item.en);
-            const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), item.en, ansW - g.gridUnit * 0.8, g.unit * 1.92 * customCal.scaleMult, 6.2);
-            page.drawText(fitted.text, {
-              x: lineX + g.gridUnit * 0.35,
-              y: g.baselineY + customCal.offsetCells * g.unit,
-              size: fitted.size,
-              font: f,
-              color: rgb(0.11, 0.31, 0.78),
-            });
+            const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), item.en, ansW - g.gridUnit * 0.8, g.unit * 1.92 * customCal.scaleMult, 6.2);
+            drawPdfTextSpaced(
+              page,
+              fitted.text,
+              lineX + g.gridUnit * 0.35,
+              g.baselineY + customCal.offsetCells * g.unit,
+              f,
+              fitted.size,
+              rgb(0.11, 0.31, 0.78),
+              customCal
+            );
           }
         }
       } else if (answer) {
@@ -3190,14 +3486,17 @@ async function drawMixBlockPdf(
           });
         } else {
           const f = fontFor(item.en);
-          const fitted = fitTextWidth((t, s) => f.widthOfTextAtSize(t, s), item.en, ansW, 10 * stdMult * customCal.scaleMult, 6.5);
-          page.drawText(fitted.text, {
-            x: lineX,
-            y: base + customCal.nonGridShiftPt,
-            size: fitted.size,
-            font: f,
-            color: rgb(0.11, 0.31, 0.78),
-          });
+          const fitted = fitTextWidth((t, s) => measurePdfTextSpaced(f, t, s, customCal), item.en, ansW, 10 * stdMult * customCal.scaleMult, 6.5);
+          drawPdfTextSpaced(
+            page,
+            fitted.text,
+            lineX,
+            base + customCal.nonGridShiftPt,
+            f,
+            fitted.size,
+            rgb(0.11, 0.31, 0.78),
+            customCal
+          );
         }
       } else {
         page.drawLine({
@@ -3213,13 +3512,22 @@ async function drawMixBlockPdf(
       const promptStr = `${num}. ${prompt}`;
       const pFont = fontFor(promptStr);
       const fittedP = fitTextWidth(
-        (t, s) => pFont.widthOfTextAtSize(t, s),
+        (t, s) => measurePdfTextSpaced(pFont, t, s, customCal),
         promptStr,
         colW * 0.52,
         9.5 * stdMult * customCal.scaleMult,
         6.5
       );
-      page.drawText(fittedP.text, { x: cellX, y: base + customCal.nonGridShiftPt, size: fittedP.size, font: pFont });
+      drawPdfTextSpaced(
+        page,
+        fittedP.text,
+        cellX,
+        base + customCal.nonGridShiftPt,
+        pFont,
+        fittedP.size,
+        rgb(0.08, 0.1, 0.15),
+        customCal
+      );
       const ansStartX = cellX + colW * 0.54;
       const ansW = cellX + colW - ansStartX;
       if (useOverlay) {
@@ -3243,14 +3551,17 @@ async function drawMixBlockPdf(
             });
           } else {
             const aFont = fontFor(ans);
-            const fittedA = fitTextWidth((t, s) => aFont.widthOfTextAtSize(t, s), ans, ansW - g.gridUnit * 0.7, g.unit * 1.92 * customCal.scaleMult, 6.2);
-            page.drawText(fittedA.text, {
-              x: ansStartX + g.gridUnit * 0.3,
-              y: g.baselineY + customCal.offsetCells * g.unit,
-              size: fittedA.size,
-              font: aFont,
-              color: rgb(0.11, 0.31, 0.78),
-            });
+            const fittedA = fitTextWidth((t, s) => measurePdfTextSpaced(aFont, t, s, customCal), ans, ansW - g.gridUnit * 0.7, g.unit * 1.92 * customCal.scaleMult, 6.2);
+            drawPdfTextSpaced(
+              page,
+              fittedA.text,
+              ansStartX + g.gridUnit * 0.3,
+              g.baselineY + customCal.offsetCells * g.unit,
+              aFont,
+              fittedA.size,
+              rgb(0.11, 0.31, 0.78),
+              customCal
+            );
           }
         }
       } else if (answer) {
@@ -3262,14 +3573,17 @@ async function drawMixBlockPdf(
           });
         } else {
           const aFont = fontFor(ans);
-          const fittedA = fitTextWidth((t, s) => aFont.widthOfTextAtSize(t, s), ans, colW * 0.44, 9.5 * stdMult * customCal.scaleMult, 6.5);
-          page.drawText(fittedA.text, {
-            x: cellX + colW * 0.55,
-            y: base + customCal.nonGridShiftPt,
-            size: fittedA.size,
-            font: aFont,
-            color: rgb(0.11, 0.31, 0.78),
-          });
+          const fittedA = fitTextWidth((t, s) => measurePdfTextSpaced(aFont, t, s, customCal), ans, colW * 0.44, 9.5 * stdMult * customCal.scaleMult, 6.5);
+          drawPdfTextSpaced(
+            page,
+            fittedA.text,
+            cellX + colW * 0.55,
+            base + customCal.nonGridShiftPt,
+            aFont,
+            fittedA.size,
+            rgb(0.11, 0.31, 0.78),
+            customCal
+          );
         }
       } else {
         page.drawLine({
@@ -3356,23 +3670,108 @@ function drawCanvasHeading(
   ctx.textAlign = 'left';
 }
 
+function measureCanvasTextSpaced(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  sizePx: number,
+  spacing: TextSpacingSpec = 0
+): number {
+  if (!text) return 0;
+  const { letterSpacingEm, ligatureOverlaps, hasLigatures } = unpackTextSpacing(spacing);
+  if ((Math.abs(letterSpacingEm) < 0.001 && !hasLigatures) || text.length <= 1) {
+    return ctx.measureText(text).width;
+  }
+  const parts = splitGraphemes(text);
+  if (parts.length <= 1) return ctx.measureText(text).width;
+  const extra = letterSpacingEm * sizePx;
+  let total = 0;
+  for (let i = 0; i < parts.length; i += 1) {
+    const ch = parts[i];
+    const w = ctx.measureText(ch).width;
+    total += w;
+    if (i < parts.length - 1) {
+      total += extra;
+      if (hasLigatures && ligatureOverlaps) {
+        const pairKey = `${ch}${parts[i + 1]}`.toLowerCase();
+        const overlapPct = ligatureOverlaps[pairKey] || 0;
+        if (overlapPct !== 0) {
+          total -= (overlapPct / 100) * w;
+        }
+      }
+    }
+  }
+  return Math.max(0, total);
+}
+
+function drawCanvasTextSpaced(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  sizePx: number,
+  spacing: TextSpacingSpec = 0,
+  align: 'left' | 'center' | 'right' = 'left'
+): number {
+  if (!text) return 0;
+  const prevAlign = ctx.textAlign;
+  const { letterSpacingEm, ligatureOverlaps, hasLigatures } = unpackTextSpacing(spacing);
+  if ((Math.abs(letterSpacingEm) < 0.001 && !hasLigatures) || text.length <= 1) {
+    ctx.textAlign = align;
+    ctx.fillText(text, x, y);
+    const w = ctx.measureText(text).width;
+    ctx.textAlign = prevAlign;
+    return w;
+  }
+  const parts = splitGraphemes(text);
+  if (parts.length <= 1) {
+    ctx.textAlign = align;
+    ctx.fillText(text, x, y);
+    const w = ctx.measureText(text).width;
+    ctx.textAlign = prevAlign;
+    return w;
+  }
+  const totalW = measureCanvasTextSpaced(ctx, text, sizePx, spacing);
+  let cursorX = align === 'center' ? x - totalW / 2 : align === 'right' ? x - totalW : x;
+  const extra = letterSpacingEm * sizePx;
+  ctx.textAlign = 'left';
+  for (let i = 0; i < parts.length; i += 1) {
+    const ch = parts[i];
+    const w = ctx.measureText(ch).width;
+    ctx.fillText(ch, cursorX, y);
+    cursorX += w;
+    if (i < parts.length - 1) {
+      cursorX += extra;
+      if (hasLigatures && ligatureOverlaps) {
+        const pairKey = `${ch}${parts[i + 1]}`.toLowerCase();
+        const overlapPct = ligatureOverlaps[pairKey] || 0;
+        if (overlapPct !== 0) {
+          cursorX -= (overlapPct / 100) * w;
+        }
+      }
+    }
+  }
+  ctx.textAlign = prevAlign;
+  return totalW;
+}
+
 function fitCanvasText(
   ctx: CanvasRenderingContext2D,
   text: string,
   maxPx: number,
   startPx: number,
   minPx: number,
-  fontTemplate: (px: number) => string
+  fontTemplate: (px: number) => string,
+  spacing: TextSpacingSpec = 0
 ): { text: string; sizePx: number } {
   let px = startPx;
   ctx.font = fontTemplate(px);
-  while (px > minPx && ctx.measureText(text).width > maxPx) {
+  while (px > minPx && measureCanvasTextSpaced(ctx, text, px, spacing) > maxPx) {
     px -= 0.5;
     ctx.font = fontTemplate(px);
   }
-  if (ctx.measureText(text).width <= maxPx) return { text, sizePx: px };
+  if (measureCanvasTextSpaced(ctx, text, px, spacing) <= maxPx) return { text, sizePx: px };
   let clipped = text;
-  while (clipped.length > 1 && ctx.measureText(`${clipped}…`).width > maxPx) {
+  while (clipped.length > 1 && measureCanvasTextSpaced(ctx, `${clipped}…`, px, spacing) > maxPx) {
     clipped = clipped.slice(0, -1);
   }
   return { text: `${clipped}…`, sizePx: px };
@@ -3484,7 +3883,9 @@ export function buildPreviewDescriptors(
   const customCal = resolveCustomCalibration(
     activeFontStyle,
     config.customFontScale,
-    config.customFontBaselineOffset
+    config.customFontBaselineOffset,
+    config.customFontLetterSpacing,
+    config.customFontLigatureOverlaps
   );
   const useOverlay = (useViet || customCal.isCustom) && Boolean(config.guidelineOverlay);
   const overlayBlocks: GridBlockCount = config.typingImageGridBlocks === 5 ? 5 : 4;
@@ -3604,15 +4005,19 @@ export function buildPreviewDescriptors(
                   (maxW - mm(0.8)) * scale,
                   g.unit * 1.92 * customCal.scaleMult * scale,
                   5.5 * scale,
-                  (px) => `${px}px ${activeFontFamily}`
+                  (px) => `${px}px ${activeFontFamily}`,
+                  customCal
                 );
                 ctx.fillStyle = '#0F172A';
                 ctx.font = `${fitted.sizePx}px ${activeFontFamily}`;
-                ctx.textAlign = 'center';
-                ctx.fillText(
+                drawCanvasTextSpaced(
+                  ctx,
                   fitted.text,
                   x + (cellW * scale) / 2,
-                  (g.baselineY - customCal.offsetCells * g.unit) * scale
+                  (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                  fitted.sizePx,
+                  customCal,
+                  'center'
                 );
               } else {
                 const fitted = fitCanvasText(
@@ -3621,15 +4026,19 @@ export function buildPreviewDescriptors(
                   (cellW - mm(2.2)) * scale,
                   11.5 * profile.fontScale * stdMult * customCal.scaleMult * scale,
                   6.5 * scale,
-                  (px) => `${px}px ${activeFontFamily}`
+                  (px) => `${px}px ${activeFontFamily}`,
+                  customCal
                 );
                 ctx.fillStyle = '#0F172A';
                 ctx.font = `${fitted.sizePx}px ${activeFontFamily}`;
-                ctx.textAlign = 'center';
-                ctx.fillText(
+                drawCanvasTextSpaced(
+                  ctx,
                   fitted.text,
                   x + (cellW * scale) / 2,
-                  y + (cellH - mm(2.1) - customCal.nonGridShiftPt) * scale
+                  y + (cellH - mm(2.1) - customCal.nonGridShiftPt) * scale,
+                  fitted.sizePx,
+                  customCal,
+                  'center'
                 );
               }
             });
@@ -3702,11 +4111,19 @@ export function buildPreviewDescriptors(
                   clueMaxW * scale,
                   13.5 * profile.fontScale * stdMult * customCal.scaleMult * scale,
                   8.5 * scale,
-                  (px) => `${px}px ${activeFontFamily}`
+                  (px) => `${px}px ${activeFontFamily}`,
+                  customCal
                 );
                 ctx.fillStyle = '#334155';
                 ctx.font = `${fittedClue.sizePx}px ${activeFontFamily}`;
-                ctx.fillText(fittedClue.text, clueX * scale, (centerY + 4 - customCal.nonGridShiftPt) * scale);
+                drawCanvasTextSpaced(
+                  ctx,
+                  fittedClue.text,
+                  clueX * scale,
+                  (centerY + 4 - customCal.nonGridShiftPt) * scale,
+                  fittedClue.sizePx,
+                  customCal
+                );
               }
 
               const lineX = clueX + clueMaxW + mm(4);
@@ -3754,11 +4171,19 @@ export function buildPreviewDescriptors(
                       (ansW - g.gridUnit * 0.8) * scale,
                       g.unit * 1.92 * customCal.scaleMult * scale,
                       7.5 * scale,
-                      (px) => `${px}px ${activeFontFamily}`
+                      (px) => `${px}px ${activeFontFamily}`,
+                      customCal
                     );
                     ctx.fillStyle = '#1D4ED8';
                     ctx.font = `${fittedAns.sizePx}px ${activeFontFamily}`;
-                    ctx.fillText(fittedAns.text, (lineX + g.gridUnit * 0.4) * scale, customOverlayY);
+                    drawCanvasTextSpaced(
+                      ctx,
+                      fittedAns.text,
+                      (lineX + g.gridUnit * 0.4) * scale,
+                      customOverlayY,
+                      fittedAns.sizePx,
+                      customCal
+                    );
                   } else if (profile.revealFirstLetter && entry.item.en.trim().length > 0) {
                     ctx.fillStyle = '#64748B';
                     ctx.font = `${g.unit * 1.92 * customCal.scaleMult * scale}px ${activeFontFamily}`;
@@ -3779,11 +4204,19 @@ export function buildPreviewDescriptors(
                     ansW * scale,
                     13.5 * profile.fontScale * stdMult * customCal.scaleMult * scale,
                     8.5 * scale,
-                    (px) => `${px}px ${activeFontFamily}`
+                    (px) => `${px}px ${activeFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = '#1D4ED8';
                   ctx.font = `${fittedAns.sizePx}px ${activeFontFamily}`;
-                  ctx.fillText(fittedAns.text, lineX * scale, (centerY + 4 - customCal.nonGridShiftPt) * scale);
+                  drawCanvasTextSpaced(
+                    ctx,
+                    fittedAns.text,
+                    lineX * scale,
+                    (centerY + 4 - customCal.nonGridShiftPt) * scale,
+                    fittedAns.sizePx,
+                    customCal
+                  );
                 }
               } else {
                 let drawLineStart = lineX;
@@ -4026,11 +4459,19 @@ export function buildPreviewDescriptors(
                       (ansMaxW - g.gridUnit * 0.8) * scale,
                       g.unit * 1.92 * customCal.scaleMult * scale,
                       7.5 * scale,
-                      (px) => `${px}px ${activeFontFamily}`
+                      (px) => `${px}px ${activeFontFamily}`,
+                      customCal
                     );
                     ctx.fillStyle = '#1D4ED8';
                     ctx.font = `${fittedAns.sizePx}px ${activeFontFamily}`;
-                    ctx.fillText(fittedAns.text, (ansX + g.gridUnit * 0.4) * scale, customOverlayY);
+                    drawCanvasTextSpaced(
+                      ctx,
+                      fittedAns.text,
+                      (ansX + g.gridUnit * 0.4) * scale,
+                      customOverlayY,
+                      fittedAns.sizePx,
+                      customCal
+                    );
                   } else if (profile.revealFirstLetter && entry.item.en.trim().length > 0) {
                     ctx.fillStyle = '#64748B';
                     ctx.font = `${g.unit * 1.92 * customCal.scaleMult * scale}px ${activeFontFamily}`;
@@ -4051,11 +4492,19 @@ export function buildPreviewDescriptors(
                     ansMaxW * scale,
                     13 * profile.fontScale * stdMult * customCal.scaleMult * scale,
                     8 * scale,
-                    (px) => `${px}px ${activeFontFamily}`
+                    (px) => `${px}px ${activeFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = '#1D4ED8';
                   ctx.font = `${fittedAns.sizePx}px ${activeFontFamily}`;
-                  ctx.fillText(fittedAns.text, ansX * scale, (centerY + 3.5 - customCal.nonGridShiftPt) * scale);
+                  drawCanvasTextSpaced(
+                    ctx,
+                    fittedAns.text,
+                    ansX * scale,
+                    (centerY + 3.5 - customCal.nonGridShiftPt) * scale,
+                    fittedAns.sizePx,
+                    customCal
+                  );
                 }
 
                 ctx.strokeStyle = '#BFDBFE';
@@ -4251,14 +4700,18 @@ export function buildPreviewDescriptors(
                     (wordMaxW - mm(1)) * scale,
                     g.unit * 1.92 * customCal.scaleMult * scale,
                     7.5 * scale,
-                    (px) => `${px}px ${activeFontFamily}`
+                    (px) => `${px}px ${activeFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = '#0F172A';
                   ctx.font = `${fitted.sizePx}px ${activeFontFamily}`;
-                  ctx.fillText(
+                  drawCanvasTextSpaced(
+                    ctx,
                     fitted.text,
                     (wordX + g.gridUnit * 0.35) * scale,
-                    (g.baselineY - customCal.offsetCells * g.unit) * scale
+                    (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                    fitted.sizePx,
+                    customCal
                   );
                 } else {
                   const label = `${term.letter}. ${term.item.en}`;
@@ -4268,11 +4721,19 @@ export function buildPreviewDescriptors(
                     (right - termX) * scale,
                     14 * stdMult * customCal.scaleMult * scale,
                     8.5 * scale,
-                    (px) => `${px}px ${activeFontFamily}`
+                    (px) => `${px}px ${activeFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = '#0F172A';
                   ctx.font = `${fitted.sizePx}px ${activeFontFamily}`;
-                  ctx.fillText(fitted.text, termX * scale, (centerY + 4 - customCal.nonGridShiftPt) * scale);
+                  drawCanvasTextSpaced(
+                    ctx,
+                    fitted.text,
+                    termX * scale,
+                    (centerY + 4 - customCal.nonGridShiftPt) * scale,
+                    fitted.sizePx,
+                    customCal
+                  );
                 }
               }
 
@@ -4447,14 +4908,18 @@ export function buildPreviewDescriptors(
                     (wordW - mm(0.6)) * scale,
                     g.unit * 1.92 * customCal.scaleMult * scale,
                     5.5 * scale,
-                    (px) => `${px}px ${activeFontFamily}`
+                    (px) => `${px}px ${activeFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = answerKey ? '#1D4ED8' : '#0F172A';
                   ctx.font = `${fitted.sizePx}px ${activeFontFamily}`;
-                  ctx.fillText(
+                  drawCanvasTextSpaced(
+                    ctx,
                     fitted.text,
                     (wordX + g.gridUnit * 0.25) * scale,
-                    (g.baselineY - customCal.offsetCells * g.unit) * scale
+                    (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                    fitted.sizePx,
+                    customCal
                   );
                 } else {
                   const text = answerKey ? `${promptIdx + 1}. [${letter}] ${item.en}` : `${promptIdx + 1}. ____ ${item.en}`;
@@ -4464,11 +4929,19 @@ export function buildPreviewDescriptors(
                     (col.width - mm(1.5)) * scale,
                     MATCHING2_LAYOUT.promptSize * stdMult * customCal.scaleMult * scale,
                     MATCHING2_LAYOUT.promptMinSize * scale,
-                    (px) => `${px}px ${activeFontFamily}`
+                    (px) => `${px}px ${activeFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = answerKey ? '#1D4ED8' : '#0F172A';
                   ctx.font = `${fitted.sizePx}px ${activeFontFamily}`;
-                  ctx.fillText(fitted.text, col.start * scale, (baseY - customCal.nonGridShiftPt) * scale);
+                  drawCanvasTextSpaced(
+                    ctx,
+                    fitted.text,
+                    col.start * scale,
+                    (baseY - customCal.nonGridShiftPt) * scale,
+                    fitted.sizePx,
+                    customCal
+                  );
                 }
               });
 
@@ -4629,14 +5102,18 @@ export function buildPreviewDescriptors(
                     (wordMaxW - mm(0.8)) * scale,
                     g.unit * 1.92 * customCal.scaleMult * scale,
                     7.2 * scale,
-                    (px) => `${px}px ${activeFontFamily}`
+                    (px) => `${px}px ${activeFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = '#0F172A';
                   ctx.font = `${fitted.sizePx}px ${activeFontFamily}`;
-                  ctx.fillText(
+                  drawCanvasTextSpaced(
+                    ctx,
                     fitted.text,
                     (wordX + g.gridUnit * 0.3) * scale,
-                    (g.baselineY - customCal.offsetCells * g.unit) * scale
+                    (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                    fitted.sizePx,
+                    customCal
                   );
                 } else {
                   const label = `${term.letter}. ${term.item.en}`;
@@ -4646,11 +5123,19 @@ export function buildPreviewDescriptors(
                     (right - termX) * scale,
                     12.5 * stdMult * customCal.scaleMult * scale,
                     8 * scale,
-                    (px) => `${px}px ${activeFontFamily}`
+                    (px) => `${px}px ${activeFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = '#0F172A';
                   ctx.font = `${fitted.sizePx}px ${activeFontFamily}`;
-                  ctx.fillText(fitted.text, termX * scale, (centerY + 3.5 - customCal.nonGridShiftPt) * scale);
+                  drawCanvasTextSpaced(
+                    ctx,
+                    fitted.text,
+                    termX * scale,
+                    (centerY + 3.5 - customCal.nonGridShiftPt) * scale,
+                    fitted.sizePx,
+                    customCal
+                  );
                 }
               }
 
@@ -4840,14 +5325,22 @@ export function buildPreviewDescriptors(
                       gridW * (textScale === 2 ? 0.64 : 0.44) * scale,
                       gridFontSize * scale,
                       7.2 * scale,
-                      (px) => `${px}px ${activeFontFamily}`
+                      (px) => `${px}px ${activeFontFamily}`,
+                      customCal
                     );
                     fittedSampleText = fittedSample.text;
                     fittedSampleSizePx = fittedSample.sizePx;
                     ctx.fillStyle = '#1E293B';
                     ctx.font = `${fittedSampleSizePx}px ${activeFontFamily}`;
-                    ctx.fillText(fittedSampleText, sampleStartX * scale, (baselineY - gridBaselineShift) * scale);
-                    sampleW = ctx.measureText(fittedSampleText).width / scale;
+                    sampleW =
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fittedSampleText,
+                        sampleStartX * scale,
+                        (baselineY - gridBaselineShift) * scale,
+                        fittedSampleSizePx,
+                        customCal
+                      ) / scale;
                   }
 
                   // Snap separator tick to next clean vertical grid line
@@ -4881,7 +5374,14 @@ export function buildPreviewDescriptors(
                     } else {
                       ctx.fillStyle = '#CBD5E1';
                       ctx.font = `${fittedSampleSizePx}px ${activeFontFamily}`;
-                      ctx.fillText(fittedSampleText, practiceStartX * scale, (baselineY - gridBaselineShift) * scale);
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fittedSampleText,
+                        practiceStartX * scale,
+                        (baselineY - gridBaselineShift) * scale,
+                        fittedSampleSizePx,
+                        customCal
+                      );
                     }
                     const nextCols = Math.ceil((practiceStartX + sampleW - gridX) / gridUnit) + 2;
                     practiceStartX = gridX + nextCols * gridUnit;
@@ -4914,11 +5414,19 @@ export function buildPreviewDescriptors(
                       (gridRight - practiceStartX - gridUnit * 0.5) * scale,
                       gridFontSize * scale,
                       7.2 * scale,
-                      (px) => `${px}px ${activeFontFamily}`
+                      (px) => `${px}px ${activeFontFamily}`,
+                      customCal
                     );
                     ctx.fillStyle = '#1D4ED8';
                     ctx.font = `${fittedAns.sizePx}px ${activeFontFamily}`;
-                    ctx.fillText(fittedAns.text, practiceStartX * scale, (baselineY - gridBaselineShift) * scale);
+                    drawCanvasTextSpaced(
+                      ctx,
+                      fittedAns.text,
+                      practiceStartX * scale,
+                      (baselineY - gridBaselineShift) * scale,
+                      fittedAns.sizePx,
+                      customCal
+                    );
                   }
                 }
               });
@@ -5030,11 +5538,19 @@ export function buildPreviewDescriptors(
                         sampleMaxW * scale,
                         customPx,
                         6.8 * scale,
-                        (px) => `${px}px ${activeFontFamily}`
+                        (px) => `${px}px ${activeFontFamily}`,
+                        customCal
                       );
                       ctx.fillStyle = '#475569';
                       ctx.font = `${fittedS.sizePx}px ${activeFontFamily}`;
-                      ctx.fillText(fittedS.text, cursorX * scale, customY);
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fittedS.text,
+                        cursorX * scale,
+                        customY,
+                        fittedS.sizePx,
+                        customCal
+                      );
                     } else if (!answerKey && profile.revealFirstLetter && item.en.trim().length > 0) {
                       ctx.fillStyle = '#64748B';
                       ctx.font = `${customPx}px ${activeFontFamily}`;
@@ -5047,11 +5563,19 @@ export function buildPreviewDescriptors(
                         (areaRight - cursorX - g.gridUnit * 0.3) * scale,
                         customPx,
                         6.8 * scale,
-                        (px) => `${px}px ${activeFontFamily}`
+                        (px) => `${px}px ${activeFontFamily}`,
+                        customCal
                       );
                       ctx.fillStyle = '#1D4ED8';
                       ctx.font = `${fittedA.sizePx}px ${activeFontFamily}`;
-                      ctx.fillText(fittedA.text, cursorX * scale, customY);
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fittedA.text,
+                        cursorX * scale,
+                        customY,
+                        fittedA.sizePx,
+                        customCal
+                      );
                     }
                   }
                   return;
@@ -5078,16 +5602,21 @@ export function buildPreviewDescriptors(
                       sampleMaxW * scale,
                       10.5 * profile.fontScale * stdMult * customCal.scaleMult * scale,
                       6.8 * scale,
-                      (px) => `${px}px ${activeFontFamily}`
+                      (px) => `${px}px ${activeFontFamily}`,
+                      customCal
                     );
                     ctx.fillStyle = '#64748B';
                     ctx.font = `${fittedSample.sizePx}px ${activeFontFamily}`;
-                    ctx.fillText(
-                      fittedSample.text,
-                      lineStart * scale,
-                      (writingLineY - mm(1) - customCal.nonGridShiftPt) * scale
-                    );
-                    lineStart += ctx.measureText(fittedSample.text).width / scale + mm(2.2);
+                    const sw =
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fittedSample.text,
+                        lineStart * scale,
+                        (writingLineY - mm(1) - customCal.nonGridShiftPt) * scale,
+                        fittedSample.sizePx,
+                        customCal
+                      ) / scale;
+                    lineStart += sw + mm(2.2);
                   }
                 } else if (!answerKey && profile.revealFirstLetter && item.en.trim().length > 0) {
                   const firstChar = item.en.trim()[0];
@@ -5132,14 +5661,18 @@ export function buildPreviewDescriptors(
                       (areaRight - lineStart) * scale,
                       11.5 * profile.fontScale * stdMult * customCal.scaleMult * scale,
                       6.8 * scale,
-                      (px) => `${px}px ${activeFontFamily}`
+                      (px) => `${px}px ${activeFontFamily}`,
+                      customCal
                     );
                     ctx.fillStyle = '#1D4ED8';
                     ctx.font = `${fittedAns.sizePx}px ${activeFontFamily}`;
-                    ctx.fillText(
+                    drawCanvasTextSpaced(
+                      ctx,
                       fittedAns.text,
                       lineStart * scale,
-                      (writingLineY - mm(1) - customCal.nonGridShiftPt) * scale
+                      (writingLineY - mm(1) - customCal.nonGridShiftPt) * scale,
+                      fittedAns.sizePx,
+                      customCal
                     );
                   }
                 } else if (lineStart < areaRight - mm(4)) {
@@ -5268,11 +5801,19 @@ export function buildPreviewDescriptors(
                     (promptW - mm(2.5)) * scale,
                     rowCustomFontSize * scale,
                     6.2 * scale,
-                    (pxVal) => `${pxVal}px ${textFontFamily}`
+                    (pxVal) => `${pxVal}px ${textFontFamily}`,
+                    customCal
                   );
                   ctx.fillStyle = '#0F172A';
                   ctx.font = `${fittedP.sizePx}px ${textFontFamily}`;
-                  ctx.fillText(fittedP.text, (px + numW + mm(1.3)) * scale, shiftedY);
+                  drawCanvasTextSpaced(
+                    ctx,
+                    fittedP.text,
+                    (px + numW + mm(1.3)) * scale,
+                    shiftedY,
+                    fittedP.sizePx,
+                    customCal
+                  );
                 }
 
                 const ansText = mode === 'vi-to-en' ? item.en : item.vi;
@@ -5317,11 +5858,19 @@ export function buildPreviewDescriptors(
                         (answerW - mm(2.4)) * scale,
                         customOverlayPx,
                         6.0 * scale,
-                        (pxVal) => `${pxVal}px ${textFontFamily}`
+                        (pxVal) => `${pxVal}px ${textFontFamily}`,
+                        customCal
                       );
                       ctx.fillStyle = '#1D4ED8';
                       ctx.font = `${fittedA.sizePx}px ${textFontFamily}`;
-                      ctx.fillText(fittedA.text, (ansCellX + mm(1.2)) * scale, customOverlayY);
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fittedA.text,
+                        (ansCellX + mm(1.2)) * scale,
+                        customOverlayY,
+                        fittedA.sizePx,
+                        customCal
+                      );
                     } else if (profile.revealFirstLetter && ansText.trim().length > 0) {
                       ctx.fillStyle = '#94A3B8';
                       ctx.font = `${customOverlayPx}px ${textFontFamily}`;
@@ -5342,16 +5891,32 @@ export function buildPreviewDescriptors(
                       (answerW - mm(2.5)) * scale,
                       rowCustomFontSize * scale,
                       6.2 * scale,
-                      (pxVal) => `${pxVal}px ${textFontFamily}`
+                      (pxVal) => `${pxVal}px ${textFontFamily}`,
+                      customCal
                     );
                     ctx.fillStyle = '#1D4ED8';
                     ctx.font = `${fittedA.sizePx}px ${textFontFamily}`;
-                    ctx.fillText(fittedA.text, (ansCellX + mm(1.3)) * scale, shiftedY);
+                    drawCanvasTextSpaced(
+                      ctx,
+                      fittedA.text,
+                      (ansCellX + mm(1.3)) * scale,
+                      shiftedY,
+                      fittedA.sizePx,
+                      customCal
+                    );
                   }
                 } else if (profile.revealFirstLetter && ansText.trim().length > 0) {
+                  const cueSizePx = rowCustomFontSize * 0.92 * scale;
                   ctx.fillStyle = '#94A3B8';
-                  ctx.font = `${rowCustomFontSize * 0.92 * scale}px ${textFontFamily}`;
-                  ctx.fillText(`${ansText.trim()[0]}_____`, (ansCellX + mm(1.3)) * scale, shiftedY);
+                  ctx.font = `${cueSizePx}px ${textFontFamily}`;
+                  drawCanvasTextSpaced(
+                    ctx,
+                    `${ansText.trim()[0]}_____`,
+                    (ansCellX + mm(1.3)) * scale,
+                    shiftedY,
+                    cueSizePx,
+                    customCal
+                  );
                 }
               });
             }
@@ -5498,22 +6063,39 @@ export function buildPreviewDescriptors(
                         (ww - mm(1)) * scale,
                         g.unit * 1.92 * customCal.scaleMult * scale,
                         6.8 * scale,
-                        (pxVal) => `${pxVal}px ${mixFontFamily}`
+                        (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                        customCal
                       );
                       ctx.fillStyle = '#0F172A';
                       ctx.font = `${fitted.sizePx}px ${mixFontFamily}`;
-                      ctx.fillText(
+                      drawCanvasTextSpaced(
+                        ctx,
                         fitted.text,
                         (wx + g.gridUnit * 0.3) * scale,
-                        (g.baselineY - customCal.offsetCells * g.unit) * scale
+                        (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                        fitted.sizePx,
+                        customCal
                       );
                     } else {
+                      const label = `${term.letter}. ${term.item.en}`;
+                      const fitted = fitCanvasText(
+                        ctx,
+                        label,
+                        Math.max(mm(20), block.x + block.width - (rightDotX + mm(5))) * scale,
+                        10 * stdMult * customCal.scaleMult * scale,
+                        6.5 * scale,
+                        (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                        customCal
+                      );
                       ctx.fillStyle = '#0F172A';
-                      ctx.font = `${10 * stdMult * customCal.scaleMult * scale}px ${mixFontFamily}`;
-                      ctx.fillText(
-                        `${term.letter}. ${term.item.en}`,
+                      ctx.font = `${fitted.sizePx}px ${mixFontFamily}`;
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fitted.text,
                         (rightDotX + mm(5)) * scale,
-                        (cy + 3 - customCal.nonGridShiftPt) * scale
+                        (cy + 3 - customCal.nonGridShiftPt) * scale,
+                        fitted.sizePx,
+                        customCal
                       );
                     }
                   }
@@ -5558,12 +6140,24 @@ export function buildPreviewDescriptors(
                       strokeWidthUnits: vietStroke,
                     });
                   } else {
-                    ctx.fillStyle = '#334155';
-                    ctx.font = `${10.5 * stdMult * customCal.scaleMult * scale}px ${mixFontFamily}`;
-                    ctx.fillText(
+                    const fittedClue = fitCanvasText(
+                      ctx,
                       entries[i]?.scrambled || item.en,
+                      mm(70) * scale,
+                      10.5 * stdMult * customCal.scaleMult * scale,
+                      6.5 * scale,
+                      (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                      customCal
+                    );
+                    ctx.fillStyle = '#334155';
+                    ctx.font = `${fittedClue.sizePx}px ${mixFontFamily}`;
+                    drawCanvasTextSpaced(
+                      ctx,
+                      fittedClue.text,
                       (block.x + mm(27)) * scale,
-                      (cy + 3 - customCal.nonGridShiftPt) * scale
+                      (cy + 3 - customCal.nonGridShiftPt) * scale,
+                      fittedClue.sizePx,
+                      customCal
                     );
                   }
 
@@ -5600,14 +6194,18 @@ export function buildPreviewDescriptors(
                           (ansW - g.gridUnit * 0.8) * scale,
                           g.unit * 1.92 * customCal.scaleMult * scale,
                           6.8 * scale,
-                          (pxVal) => `${pxVal}px ${mixFontFamily}`
+                          (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                          customCal
                         );
                         ctx.fillStyle = '#1D4ED8';
                         ctx.font = `${fittedA.sizePx}px ${mixFontFamily}`;
-                        ctx.fillText(
+                        drawCanvasTextSpaced(
+                          ctx,
                           fittedA.text,
                           (lineX + g.gridUnit * 0.35) * scale,
-                          (g.baselineY - customCal.offsetCells * g.unit) * scale
+                          (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                          fittedA.sizePx,
+                          customCal
                         );
                       }
                     }
@@ -5619,9 +6217,25 @@ export function buildPreviewDescriptors(
                         strokeWidthUnits: vietStroke,
                       });
                     } else {
+                      const fittedA = fitCanvasText(
+                        ctx,
+                        item.en,
+                        ansW * scale,
+                        10.5 * stdMult * customCal.scaleMult * scale,
+                        6.5 * scale,
+                        (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                        customCal
+                      );
                       ctx.fillStyle = '#1D4ED8';
-                      ctx.font = `${10.5 * stdMult * customCal.scaleMult * scale}px ${mixFontFamily}`;
-                      ctx.fillText(item.en, lineX * scale, (cy + 3 - customCal.nonGridShiftPt) * scale);
+                      ctx.font = `${fittedA.sizePx}px ${mixFontFamily}`;
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fittedA.text,
+                        lineX * scale,
+                        (cy + 3 - customCal.nonGridShiftPt) * scale,
+                        fittedA.sizePx,
+                        customCal
+                      );
                     }
                   } else {
                     ctx.strokeStyle = '#64748B';
@@ -5739,20 +6353,40 @@ export function buildPreviewDescriptors(
                         (ww - mm(0.6)) * scale,
                         g.unit * 1.92 * customCal.scaleMult * scale,
                         6.2 * scale,
-                        (pxVal) => `${pxVal}px ${mixFontFamily}`
+                        (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                        customCal
                       );
                       ctx.fillStyle = answerKey ? '#1D4ED8' : '#0F172A';
                       ctx.font = `${fitted.sizePx}px ${mixFontFamily}`;
-                      ctx.fillText(
+                      drawCanvasTextSpaced(
+                        ctx,
                         fitted.text,
                         (wx + g.gridUnit * 0.25) * scale,
-                        (g.baselineY - customCal.offsetCells * g.unit) * scale
+                        (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                        fitted.sizePx,
+                        customCal
                       );
                     } else {
                       const text = answerKey ? `${pIdx + 1}. [${letter}] ${item.en}` : `${pIdx + 1}. ____ ${item.en}`;
+                      const fitted = fitCanvasText(
+                        ctx,
+                        text,
+                        (colW - mm(2)) * scale,
+                        10 * stdMult * customCal.scaleMult * scale,
+                        6.5 * scale,
+                        (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                        customCal
+                      );
                       ctx.fillStyle = answerKey ? '#1D4ED8' : '#0F172A';
-                      ctx.font = `${10 * stdMult * customCal.scaleMult * scale}px ${mixFontFamily}`;
-                      ctx.fillText(text, px * scale, (py - customCal.nonGridShiftPt) * scale);
+                      ctx.font = `${fitted.sizePx}px ${mixFontFamily}`;
+                      drawCanvasTextSpaced(
+                        ctx,
+                        fitted.text,
+                        px * scale,
+                        (py - customCal.nonGridShiftPt) * scale,
+                        fitted.sizePx,
+                        customCal
+                      );
                     }
                   });
                   cursorTop += group.height + MIX_MATCHING2.groupGap;
@@ -5817,14 +6451,18 @@ export function buildPreviewDescriptors(
                             (ansW - g.gridUnit * 0.8) * scale,
                             g.unit * 1.92 * customCal.scaleMult * scale,
                             6.8 * scale,
-                            (pxVal) => `${pxVal}px ${mixFontFamily}`
+                            (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                            customCal
                           );
                           ctx.fillStyle = '#1D4ED8';
                           ctx.font = `${fittedA.sizePx}px ${mixFontFamily}`;
-                          ctx.fillText(
+                          drawCanvasTextSpaced(
+                            ctx,
                             fittedA.text,
                             (lineX + g.gridUnit * 0.35) * scale,
-                            (g.baselineY - customCal.offsetCells * g.unit) * scale
+                            (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                            fittedA.sizePx,
+                            customCal
                           );
                         }
                       }
@@ -5836,9 +6474,25 @@ export function buildPreviewDescriptors(
                           strokeWidthUnits: vietStroke,
                         });
                       } else {
+                        const fittedA = fitCanvasText(
+                          ctx,
+                          item.en,
+                          ansW * scale,
+                          10 * stdMult * customCal.scaleMult * scale,
+                          6.5 * scale,
+                          (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                          customCal
+                        );
                         ctx.fillStyle = '#1D4ED8';
-                        ctx.font = `${10 * stdMult * customCal.scaleMult * scale}px ${mixFontFamily}`;
-                        ctx.fillText(item.en, lineX * scale, (baseY - customCal.nonGridShiftPt) * scale);
+                        ctx.font = `${fittedA.sizePx}px ${mixFontFamily}`;
+                        drawCanvasTextSpaced(
+                          ctx,
+                          fittedA.text,
+                          lineX * scale,
+                          (baseY - customCal.nonGridShiftPt) * scale,
+                          fittedA.sizePx,
+                          customCal
+                        );
                       }
                     } else {
                       ctx.strokeStyle = '#64748B';
@@ -5850,9 +6504,25 @@ export function buildPreviewDescriptors(
                   } else {
                     const prompt = sec.type === 'typing-2' ? item.vi : item.en;
                     const ans = sec.type === 'typing-2' ? item.en : item.vi;
+                    const fittedP = fitCanvasText(
+                      ctx,
+                      `${num}. ${prompt}`,
+                      colW * 0.52 * scale,
+                      9.5 * stdMult * customCal.scaleMult * scale,
+                      6.5 * scale,
+                      (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                      customCal
+                    );
                     ctx.fillStyle = '#0F172A';
-                    ctx.font = `${9.5 * stdMult * customCal.scaleMult * scale}px ${mixFontFamily}`;
-                    ctx.fillText(`${num}. ${prompt}`, cellX * scale, (baseY - customCal.nonGridShiftPt) * scale);
+                    ctx.font = `${fittedP.sizePx}px ${mixFontFamily}`;
+                    drawCanvasTextSpaced(
+                      ctx,
+                      fittedP.text,
+                      cellX * scale,
+                      (baseY - customCal.nonGridShiftPt) * scale,
+                      fittedP.sizePx,
+                      customCal
+                    );
                     const ansStartX = cellX + colW * 0.54;
                     const ansW = cellX + colW - ansStartX;
                     if (useOverlay) {
@@ -5886,14 +6556,18 @@ export function buildPreviewDescriptors(
                             (ansW - g.gridUnit * 0.7) * scale,
                             g.unit * 1.92 * customCal.scaleMult * scale,
                             6.5 * scale,
-                            (pxVal) => `${pxVal}px ${mixFontFamily}`
+                            (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                            customCal
                           );
                           ctx.fillStyle = '#1D4ED8';
                           ctx.font = `${fittedA.sizePx}px ${mixFontFamily}`;
-                          ctx.fillText(
+                          drawCanvasTextSpaced(
+                            ctx,
                             fittedA.text,
                             (ansStartX + g.gridUnit * 0.3) * scale,
-                            (g.baselineY - customCal.offsetCells * g.unit) * scale
+                            (g.baselineY - customCal.offsetCells * g.unit) * scale,
+                            fittedA.sizePx,
+                            customCal
                           );
                         }
                       }
@@ -5905,9 +6579,25 @@ export function buildPreviewDescriptors(
                           strokeWidthUnits: vietStroke,
                         });
                       } else {
+                        const fittedA = fitCanvasText(
+                          ctx,
+                          ans,
+                          colW * 0.44 * scale,
+                          9.5 * stdMult * customCal.scaleMult * scale,
+                          6.5 * scale,
+                          (pxVal) => `${pxVal}px ${mixFontFamily}`,
+                          customCal
+                        );
                         ctx.fillStyle = '#1D4ED8';
-                        ctx.font = `${9.5 * stdMult * customCal.scaleMult * scale}px ${mixFontFamily}`;
-                        ctx.fillText(ans, (cellX + colW * 0.55) * scale, (baseY - customCal.nonGridShiftPt) * scale);
+                        ctx.font = `${fittedA.sizePx}px ${mixFontFamily}`;
+                        drawCanvasTextSpaced(
+                          ctx,
+                          fittedA.text,
+                          (cellX + colW * 0.55) * scale,
+                          (baseY - customCal.nonGridShiftPt) * scale,
+                          fittedA.sizePx,
+                          customCal
+                        );
                       }
                     } else {
                       ctx.strokeStyle = '#64748B';
@@ -5977,6 +6667,8 @@ export async function generateSingleWorksheetPdf(
     customFontId: config.customFontId,
     customFontScale: config.customFontScale,
     customFontBaselineOffset: config.customFontBaselineOffset,
+    customFontLetterSpacing: config.customFontLetterSpacing,
+    customFontLigatureOverlaps: config.customFontLigatureOverlaps,
   };
   let bytes: Uint8Array;
   switch (type) {
@@ -6060,6 +6752,8 @@ export async function generateSingleWorksheetPdf(
           customFontId: config.customFontId,
           customFontScale: config.customFontScale,
           customFontBaselineOffset: config.customFontBaselineOffset,
+          customFontLetterSpacing: config.customFontLetterSpacing,
+          customFontLigatureOverlaps: config.customFontLigatureOverlaps,
         },
         diff
       );

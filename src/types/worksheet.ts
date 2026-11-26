@@ -49,6 +49,8 @@ export interface CustomFontAsset {
   bytes: Uint8Array;
   scale: number;
   baselineOffset: number;
+  letterSpacing: number;
+  ligatureOverlaps: Record<string, number>;
   uploadedAt: string;
 }
 
@@ -99,6 +101,8 @@ export interface WorksheetConfig {
   customFontId: string | null;
   customFontScale: number;
   customFontBaselineOffset: number;
+  customFontLetterSpacing: number;
+  customFontLigatureOverlaps: Record<string, number>;
 }
 
 export interface AnagramEntry {

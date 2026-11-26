@@ -9,9 +9,11 @@ import {
   addCustomFontFile,
   clampBaselineOffset,
   clampCustomScale,
+  clampLetterSpacing,
   getCustomFontById,
   loadStoredCustomFonts,
   removeCustomFont,
+  sanitizeLigatureOverlaps,
   updateCustomFontCalibration,
 } from './lib/customFontStore';
 import { COPY } from './lib/i18n';
@@ -133,13 +135,28 @@ export default function App() {
           restoredConfig.customFontId = customFonts[0].id;
           restoredConfig.customFontScale = customFonts[0].scale;
           restoredConfig.customFontBaselineOffset = customFonts[0].baselineOffset;
+          restoredConfig.customFontLetterSpacing = customFonts[0].letterSpacing;
+          restoredConfig.customFontLigatureOverlaps = { ...customFonts[0].ligatureOverlaps };
         } else {
           restoredConfig.fontStyle = 'penmanship';
           restoredConfig.customFontId = null;
           restoredConfig.customFontScale = 1;
           restoredConfig.customFontBaselineOffset = 0;
+          restoredConfig.customFontLetterSpacing = 0;
+          restoredConfig.customFontLigatureOverlaps = {};
         }
+      } else {
+        restoredConfig.customFontLetterSpacing = clampLetterSpacing(
+          restoredConfig.customFontLetterSpacing ?? matched.letterSpacing
+        );
+        restoredConfig.customFontLigatureOverlaps = sanitizeLigatureOverlaps(
+          restoredConfig.customFontLigatureOverlaps ?? matched.ligatureOverlaps
+        );
       }
+    } else {
+      restoredConfig.customFontLigatureOverlaps = sanitizeLigatureOverlaps(
+        restoredConfig.customFontLigatureOverlaps
+      );
     }
     setRows(pendingRestore.rows);
     setImages(restoredImages);
@@ -217,6 +234,8 @@ export default function App() {
           customFontId: primary.id,
           customFontScale: primary.scale,
           customFontBaselineOffset: primary.baselineOffset,
+          customFontLetterSpacing: primary.letterSpacing,
+          customFontLigatureOverlaps: { ...primary.ligatureOverlaps },
         }));
       }
 
@@ -232,6 +251,8 @@ export default function App() {
       customFontId: font.id,
       customFontScale: font.scale,
       customFontBaselineOffset: font.baselineOffset,
+      customFontLetterSpacing: font.letterSpacing,
+      customFontLigatureOverlaps: { ...font.ligatureOverlaps },
     }));
   }, []);
 
@@ -249,6 +270,8 @@ export default function App() {
             customFontId: remaining[0].id,
             customFontScale: remaining[0].scale,
             customFontBaselineOffset: remaining[0].baselineOffset,
+            customFontLetterSpacing: remaining[0].letterSpacing,
+            customFontLigatureOverlaps: { ...remaining[0].ligatureOverlaps },
           };
         }
         return {
@@ -257,6 +280,8 @@ export default function App() {
           customFontId: null,
           customFontScale: 1,
           customFontBaselineOffset: 0,
+          customFontLetterSpacing: 0,
+          customFontLigatureOverlaps: {},
         };
       });
     },
@@ -264,15 +289,27 @@ export default function App() {
   );
 
   const handleUpdateCustomFontCalibration = useCallback(
-    (scale: number, baselineOffset: number) => {
+    (
+      scale: number,
+      baselineOffset: number,
+      letterSpacing: number,
+      ligatureOverlaps?: Record<string, number>
+    ) => {
       const nextScale = clampCustomScale(scale);
       const nextOffset = clampBaselineOffset(baselineOffset);
+      const nextSpacing = clampLetterSpacing(letterSpacing);
+      const nextLigatures =
+        ligatureOverlaps !== undefined
+          ? sanitizeLigatureOverlaps(ligatureOverlaps)
+          : sanitizeLigatureOverlaps(config.customFontLigatureOverlaps);
       const activeId = config.customFontId;
 
       setConfig((prev) => ({
         ...prev,
         customFontScale: nextScale,
         customFontBaselineOffset: nextOffset,
+        customFontLetterSpacing: nextSpacing,
+        customFontLigatureOverlaps: nextLigatures,
       }));
 
       if (!activeId) return;
@@ -280,7 +317,13 @@ export default function App() {
       setCustomFonts((prev) =>
         prev.map((font) =>
           font.id === activeId
-            ? { ...font, scale: nextScale, baselineOffset: nextOffset }
+            ? {
+                ...font,
+                scale: nextScale,
+                baselineOffset: nextOffset,
+                letterSpacing: nextSpacing,
+                ligatureOverlaps: nextLigatures,
+              }
             : font
         )
       );
@@ -289,10 +332,16 @@ export default function App() {
         window.clearTimeout(calibrationTimerRef.current);
       }
       calibrationTimerRef.current = window.setTimeout(() => {
-        void updateCustomFontCalibration(activeId, nextScale, nextOffset);
+        void updateCustomFontCalibration(
+          activeId,
+          nextScale,
+          nextOffset,
+          nextSpacing,
+          nextLigatures
+        );
       }, 120);
     },
-    [config.customFontId]
+    [config.customFontId, config.customFontLigatureOverlaps]
   );
 
   const handleToggleWorksheetType = useCallback((type: WorksheetType) => {

@@ -53,8 +53,8 @@ export interface GlyphStroke {
   isDot?: boolean;
 }
 
-export type ExitKind = 'low' | 'high' | 'oval-o' | 'stop';
-export type EntryKind = 'init' | 'from-low' | 'from-high';
+export type ExitKind = 'low' | 'low-e' | 'high' | 'oval-o' | 'stop';
+export type EntryKind = 'init' | 'from-low' | 'from-low-e' | 'from-high';
 
 export interface GlyphDef {
   width: number;
@@ -141,7 +141,17 @@ function tallLoopSpineX(entry: EntryKind): number {
  * [(0.16, 0.0), (0.26, 0.0), (0.45, 0.46), (0.63, 1.0)] at y = 0.50.
  */
 const HOOK_REACH = 0.45;
-function bottomHookSegments(sx: number): StrokeSegment[] {
+const HOOK_REACH_E = 0.38;
+function hookReach(toE = false): number {
+  return toE ? HOOK_REACH_E : HOOK_REACH;
+}
+function bottomHookSegments(sx: number, toE = false): StrokeSegment[] {
+  if (toE) {
+    return [
+      C(sx, 0.06, sx + 0.06, 0.0, sx + 0.16, 0.0),
+      C(sx + 0.25, 0.0, sx + 0.30, 0.132, sx + HOOK_REACH_E, 0.20),
+    ];
+  }
   return [
     C(sx, 0.06, sx + 0.06, 0.0, sx + 0.16, 0.0),
     C(sx + 0.227, 0.0, sx + 0.333, 0.204, sx + HOOK_REACH, 0.50),
@@ -150,11 +160,22 @@ function bottomHookSegments(sx: number): StrokeSegment[] {
 
 /**
  * Pure concave-upward exit arc from a rounded baseline bowl at (bx, 0.0) to (bx + reach, 0.50)
- * matching the exact unified slope dy/dx = 2.53 (used by c, e, x, z).
+ * preserving the exact unified slope dy/dx = 2.53 for any reach >= 0.32 (used by c, e, x, z),
+ * or handing off smoothly at y = 0.20 (slope 0.85) when followed by 'e'.
  */
-function bowlExitSegment(bx: number, reach = 0.36): StrokeSegment {
-  const s = reach / 0.36;
-  return C(bx + 0.12 * s, 0.0, bx + 0.24 * s, 0.197, bx + reach, 0.50);
+function bowlReach(reach = 0.44, toE = false): number {
+  return toE ? Math.max(0.32, reach - 0.06) : reach;
+}
+function bowlExitSegment(bx: number, reach = 0.44, toE = false): StrokeSegment {
+  const actualReach = bowlReach(reach, toE);
+  const ex = bx + actualReach;
+  if (toE) {
+    const x1 = bx + Math.max(0.12, actualReach * 0.42);
+    return C(x1, 0.0, ex - 0.10, 0.115, ex, 0.20);
+  }
+  const x1 = bx + Math.max(0.12, actualReach * 0.38);
+  const x2 = ex - 0.12;
+  return C(x1, 0.0, x2, 0.197, ex, 0.50);
 }
 
 /**
@@ -189,54 +210,67 @@ function stemLeadIn(stemX: number, entry: EntryKind): { startX: number; startY: 
 
 /**
  * Shared deep teardrop descender loop (nét khuyết dưới, stemX down to -1.50,
- * crossing cleanly at y=0.0 and rising smoothly concave-up to (stemX + 0.34, 0.50) with slope 2.53).
+ * crossing cleanly at y=0.0 and rising smoothly concave-up to (stemX + 0.42, 0.50) with slope 2.53).
  */
-const DESC_EXIT_REACH = 0.34;
-function deepDescenderLoopSegments(stemX: number): StrokeSegment[] {
-  const ex = stemX + DESC_EXIT_REACH;
+const DESC_EXIT_REACH = 0.42;
+const DESC_EXIT_REACH_E = 0.38;
+function descReach(toE = false): number {
+  return toE ? DESC_EXIT_REACH_E : DESC_EXIT_REACH;
+}
+function deepDescenderLoopSegments(stemX: number, toE = false): StrokeSegment[] {
+  const ex = stemX + descReach(toE);
   return [
     L(stemX, -1.04),
     C(stemX, -1.44, stemX - 0.16, -1.52, stemX - 0.30, -1.48),
     C(stemX - 0.46, -1.42, stemX - 0.46, -1.02, stemX - 0.30, -0.70),
     C(stemX - 0.14, -0.38, stemX - 0.04, -0.14, stemX + 0.04, 0.0),
-    C(stemX + 0.14, 0.17, ex - 0.10, 0.247, ex, 0.50),
+    toE
+      ? C(stemX + 0.16, 0.08, ex - 0.10, 0.115, ex, 0.20)
+      : C(stemX + 0.16, 0.17, ex - 0.12, 0.197, ex, 0.50),
   ];
 }
 
 /**
  * Soft, petite top-right ribbon knot (nét thắt trên) for b, v, w matching LittlePen's bhkeia & bumblebee.
  * Curves gently inward from the rounded cheek up to a delicate crest (y = 0.93),
- * loops softly counter-clockwise down to y = 0.73, and glides smoothly out to (rx + 0.14, 0.76).
+ * loops softly counter-clockwise down to y = 0.73, and glides smoothly out to (rx + 0.24, 0.76).
  */
-const HIGH_KNOT_REACH = 0.14;
+const HIGH_KNOT_REACH = 0.24;
 function topRightKnotSegments(rx: number): StrokeSegment[] {
   return [
     C(rx - 0.03, 0.82, rx - 0.09, 0.94, rx - 0.16, 0.93),
     C(rx - 0.23, 0.91, rx - 0.23, 0.75, rx - 0.12, 0.73),
-    C(rx - 0.02, 0.71, rx + 0.06, 0.73, rx + HIGH_KNOT_REACH, 0.76),
+    C(rx - 0.01, 0.71, rx + 0.12, 0.73, rx + HIGH_KNOT_REACH, 0.76),
   ];
 }
 
 // ============================================================
 // CONTEXT-AWARE LOWERCASE GLYPH BUILDER (a–z + f, j, w, z)
 // ============================================================
-function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean, nextIsOval: boolean): GlyphDef | null {
+function buildLowercaseGlyph(
+  ch: string,
+  entry: EntryKind,
+  nextConnects: boolean,
+  nextIsOval: boolean,
+  nextIsE = false
+): GlyphDef | null {
   const sp = tallLoopSpineX(entry);
+  const lowExitKind: ExitKind = nextIsE ? 'low-e' : 'low';
 
   switch (ch) {
     case 'a': {
       const stemX = 0.81;
-      const ex = stemX + HOOK_REACH;
+      const ex = stemX + hookReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         isOvalLeft: true,
         ovalTouchLowX: 0.07,
-        ovalTouchHighX: 0.15,
+        ovalTouchHighX: 0.13,
         strokes: [
           ovalStroke(0.06, 0.75, 1.0),
-          M(stemX, 1.0, [L(stemX, 0.26), ...bottomHookSegments(stemX)]),
+          M(stemX, 1.0, [L(stemX, 0.26), ...bottomHookSegments(stemX, nextIsE)]),
         ],
       };
     }
@@ -263,19 +297,22 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
     }
 
     case 'c': {
-      const ex = 0.45 + 0.36;
+      // Open primary 'c' with airy exit tail reaching 0.94 so following oval (cat, cow)
+      // or loop letters (ice, cream) maintain crisp separation from c's top beak at x=0.68.
+      const bx = 0.42;
+      const ex = bx + bowlReach(0.52, nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         isOvalLeft: true,
         ovalTouchLowX: 0.09,
-        ovalTouchHighX: 0.19,
+        ovalTouchHighX: 0.16,
         strokes: [
-          M(0.76, 0.82, [
-            C(0.66, 1.02, 0.26, 1.04, 0.13, 0.68),
-            C(0.04, 0.36, 0.14, 0.0, 0.45, 0.0),
-            bowlExitSegment(0.45, 0.36),
+          M(0.68, 0.82, [
+            C(0.58, 1.02, 0.24, 1.04, 0.12, 0.68),
+            C(0.04, 0.36, 0.13, 0.0, bx, 0.0),
+            bowlExitSegment(bx, 0.52, nextIsE),
           ]),
         ],
       };
@@ -283,75 +320,77 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
 
     case 'd': {
       const stemX = 0.81;
-      const ex = stemX + HOOK_REACH;
+      const ex = stemX + hookReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         isOvalLeft: true,
         ovalTouchLowX: 0.07,
-        ovalTouchHighX: 0.15,
+        ovalTouchHighX: 0.13,
         strokes: [
           ovalStroke(0.06, 0.75, 1.0),
-          M(stemX, 2.0, [L(stemX, 0.26), ...bottomHookSegments(stemX)]),
+          M(stemX, 2.0, [L(stemX, 0.26), ...bottomHookSegments(stemX, nextIsE)]),
         ],
       };
     }
 
     case 'e': {
-      if (entry === 'from-low') {
-        // Seamlessly continues the incoming C1 slope (dy/dx = 2.53) from (0.0, 0.50)
-        // up into e's graceful open teardrop eye, loops softly over y=1.0, crosses cleanly to baseline,
-        // and sweeps out concave-upward to (0.68, 0.50) with exact matching slope 2.53.
-        const bx = 0.30;
-        const ex = bx + 0.38;
+      if (entry === 'from-low-e' || entry === 'from-low') {
+        // Continues the smooth low-e handoff from (0.0, 0.20) at exact slope 0.85,
+        // opening the exact same full-bodied teardrop eye as initial 'e' (e.g., umbrella == house)
+        // while keeping the left spine strictly >= +0.125 (zero overlap in ce/ee/re).
+        const bx = 0.50;
+        const ex = bx + bowlReach(0.44, nextIsE);
         return {
           width: ex,
-          exitKind: 'low',
+          exitKind: lowExitKind,
           exitX: ex,
           strokes: [
-            M(0.0, 0.50, [
-              C(0.075, 0.69, 0.27, 0.83, 0.28, 0.92),
-              C(0.29, 1.03, 0.07, 1.04, -0.02, 0.74),
-              C(-0.10, 0.44, 0.02, 0.0, bx, 0.0),
-              bowlExitSegment(bx, 0.38),
+            M(0.0, entry === 'from-low-e' ? 0.20 : 0.50, [
+              entry === 'from-low-e'
+                ? C(0.18, 0.353, 0.64, 0.58, 0.64, 0.84)
+                : C(0.09, 0.728, 0.64, 0.62, 0.64, 0.84),
+              C(0.64, 1.03, 0.34, 1.04, 0.19, 0.74),
+              C(0.04, 0.42, 0.16, 0.0, bx, 0.0),
+              bowlExitSegment(bx, 0.44, nextIsE),
             ]),
           ],
         };
       }
       if (entry === 'from-high') {
         // Flowing from b/v/w/o top-right ribbon knot at (0.0, 0.76) (e.g., "be" in bumblebee, "we" in flower):
-        // glides softly downward into e's lower eye with zero upward bump.
-        const bx = 0.48;
-        const ex = bx + 0.36;
+        // glides softly downward into the same full-bodied open eye as initial 'e'.
+        const bx = 0.50;
+        const ex = bx + bowlReach(0.44, nextIsE);
         return {
           width: ex,
-          exitKind: 'low',
+          exitKind: lowExitKind,
           exitX: ex,
           strokes: [
             M(0.0, 0.76, [
-              C(0.08, 0.74, 0.14, 0.56, 0.28, 0.60),
-              C(0.40, 0.64, 0.52, 0.78, 0.52, 0.90),
-              C(0.52, 1.03, 0.28, 1.04, 0.18, 0.74),
-              C(0.08, 0.44, 0.20, 0.0, bx, 0.0),
-              bowlExitSegment(bx, 0.36),
+              C(0.08, 0.74, 0.10, 0.38, 0.28, 0.44),
+              C(0.46, 0.50, 0.64, 0.64, 0.64, 0.84),
+              C(0.64, 1.03, 0.34, 1.04, 0.19, 0.74),
+              C(0.04, 0.42, 0.16, 0.0, bx, 0.0),
+              bowlExitSegment(bx, 0.44, nextIsE),
             ]),
           ],
         };
       }
-      // Initial 'e'
+      // Initial 'e' (e.g., "house", "elephant")
       const bx = 0.52;
-      const ex = bx + 0.36;
+      const ex = bx + bowlReach(0.44, nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           M(0.02, 0.08, [
             C(0.28, 0.22, 0.68, 0.56, 0.68, 0.84),
             C(0.68, 1.03, 0.38, 1.04, 0.22, 0.74),
             C(0.06, 0.42, 0.18, 0.0, bx, 0.0),
-            bowlExitSegment(bx, 0.36),
+            bowlExitSegment(bx, 0.44, nextIsE),
           ]),
         ],
       };
@@ -359,16 +398,16 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
 
     case 'f': {
       // Stylistically matched LittlePen 'f': identical tall loop + harmonious g/y descender + crossbar at y=1.0
-      const ex = sp + DESC_EXIT_REACH;
+      const ex = sp + descReach(nextIsE);
       const loop = tallUpperLoopStroke(0.0, entry);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           M(loop.startX, loop.startY, [
             ...loop.segments,
-            ...deepDescenderLoopSegments(sp),
+            ...deepDescenderLoopSegments(sp, nextIsE),
           ]),
           M(sp - 0.18, 1.0, [L(sp + 0.34, 1.0)]),
         ],
@@ -377,27 +416,27 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
 
     case 'g': {
       const stemX = 0.81;
-      const ex = stemX + DESC_EXIT_REACH;
+      const ex = stemX + descReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         isOvalLeft: true,
         ovalTouchLowX: 0.07,
-        ovalTouchHighX: 0.15,
+        ovalTouchHighX: 0.13,
         strokes: [
           ovalStroke(0.06, 0.75, 1.0),
-          M(stemX, 1.0, deepDescenderLoopSegments(stemX)),
+          M(stemX, 1.0, deepDescenderLoopSegments(stemX, nextIsE)),
         ],
       };
     }
 
     case 'h': {
       const stem2 = sp + 0.64;
-      const ex = stem2 + HOOK_REACH;
+      const ex = stem2 + hookReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           tallUpperLoopStroke(0.0, entry),
@@ -405,7 +444,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
             C(sp + 0.08, 0.86, sp + 0.30, 1.02, sp + 0.48, 1.0),
             C(stem2 - 0.02, 0.98, stem2, 0.80, stem2, 0.64),
             L(stem2, 0.26),
-            ...bottomHookSegments(stem2),
+            ...bottomHookSegments(stem2, nextIsE),
           ]),
         ],
       };
@@ -414,13 +453,13 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
     case 'i': {
       const stemX = entry === 'from-low' ? 0.18 : entry === 'from-high' ? 0.22 : 0.24;
       const lead = stemLeadIn(stemX, entry);
-      const ex = stemX + HOOK_REACH;
+      const ex = stemX + hookReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
-          M(lead.startX, lead.startY, [lead.seg, L(stemX, 0.26), ...bottomHookSegments(stemX)]),
+          M(lead.startX, lead.startY, [lead.seg, L(stemX, 0.26), ...bottomHookSegments(stemX, nextIsE)]),
           DOT(stemX, 1.34),
         ],
       };
@@ -429,13 +468,13 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
     case 'j': {
       const stemX = entry === 'from-low' ? 0.22 : entry === 'from-high' ? 0.26 : 0.42;
       const lead = stemLeadIn(stemX, entry);
-      const ex = stemX + DESC_EXIT_REACH;
+      const ex = stemX + descReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
-          M(lead.startX, lead.startY, [lead.seg, ...deepDescenderLoopSegments(stemX)]),
+          M(lead.startX, lead.startY, [lead.seg, ...deepDescenderLoopSegments(stemX, nextIsE)]),
           DOT(stemX, 1.34),
         ],
       };
@@ -443,10 +482,10 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
 
     case 'k': {
       const stem2 = sp + 0.66;
-      const ex = stem2 + HOOK_REACH;
+      const ex = stem2 + hookReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           tallUpperLoopStroke(0.0, entry),
@@ -456,21 +495,21 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
             C(sp + 0.44, 0.44, sp + 0.30, 0.46, sp + 0.30, 0.55),
             C(sp + 0.30, 0.64, sp + 0.50, 0.62, sp + 0.60, 0.48),
             C(stem2, 0.38, stem2, 0.28, stem2, 0.24),
-            ...bottomHookSegments(stem2),
+            ...bottomHookSegments(stem2, nextIsE),
           ]),
         ],
       };
     }
 
     case 'l': {
-      const ex = sp + HOOK_REACH;
+      const ex = sp + hookReach(nextIsE);
       const loop = tallUpperLoopStroke(0.26, entry);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
-          M(loop.startX, loop.startY, [...loop.segments, ...bottomHookSegments(sp)]),
+          M(loop.startX, loop.startY, [...loop.segments, ...bottomHookSegments(sp, nextIsE)]),
         ],
       };
     }
@@ -479,7 +518,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
       const s1 = entry === 'init' ? 0.44 : entry === 'from-high' ? 0.38 : 0.40;
       const s2 = s1 + 0.50;
       const s3 = s2 + 0.50;
-      const ex = s3 + HOOK_REACH;
+      const ex = s3 + hookReach(nextIsE);
       const firstArch =
         entry === 'from-low'
           ? M(0.0, 0.50, [
@@ -498,7 +537,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
               ]);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           firstArch,
@@ -506,7 +545,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
           M(s2, 0.58, [
             C(s2 + 0.08, 0.96, s3 - 0.08, 1.04, s3, 0.78),
             L(s3, 0.26),
-            ...bottomHookSegments(s3),
+            ...bottomHookSegments(s3, nextIsE),
           ]),
         ],
       };
@@ -515,7 +554,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
     case 'n': {
       const s1 = entry === 'init' ? 0.44 : entry === 'from-high' ? 0.38 : 0.40;
       const s2 = s1 + 0.50;
-      const ex = s2 + HOOK_REACH;
+      const ex = s2 + hookReach(nextIsE);
       const firstArch =
         entry === 'from-low'
           ? M(0.0, 0.50, [
@@ -534,14 +573,14 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
               ]);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           firstArch,
           M(s1, 0.58, [
             C(s1 + 0.08, 0.96, s2 - 0.08, 1.04, s2, 0.78),
             L(s2, 0.26),
-            ...bottomHookSegments(s2),
+            ...bottomHookSegments(s2, nextIsE),
           ]),
         ],
       };
@@ -558,7 +597,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
           exitX: ex,
           isOvalLeft: true,
           ovalTouchLowX: 0.07,
-          ovalTouchHighX: 0.15,
+          ovalTouchHighX: 0.13,
           strokes: [
             ovalStroke(0.06, 0.75, 1.0),
             M(0.77, 0.84, [
@@ -574,7 +613,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
         exitX: 0.87,
         isOvalLeft: true,
         ovalTouchLowX: 0.07,
-        ovalTouchHighX: 0.15,
+        ovalTouchHighX: 0.13,
         strokes: [ovalStroke(0.06, 0.75, 1.0)],
       };
     }
@@ -582,18 +621,18 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
     case 'p': {
       const stemX = entry === 'from-low' ? 0.18 : entry === 'from-high' ? 0.22 : 0.24;
       const stem2 = stemX + 0.58;
-      const ex = stem2 + HOOK_REACH;
+      const ex = stem2 + hookReach(nextIsE);
       const lead = stemLeadIn(stemX, entry);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           M(lead.startX, lead.startY, [lead.seg, L(stemX, -1.0)]),
           M(stemX, 0.56, [
             C(stemX + 0.08, 0.96, stem2 - 0.10, 1.04, stem2, 0.78),
             L(stem2, 0.26),
-            ...bottomHookSegments(stem2),
+            ...bottomHookSegments(stem2, nextIsE),
           ]),
         ],
       };
@@ -606,7 +645,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
         exitX: 0.95,
         isOvalLeft: true,
         ovalTouchLowX: 0.07,
-        ovalTouchHighX: 0.15,
+        ovalTouchHighX: 0.13,
         strokes: [ovalStroke(0.06, 0.75, 1.0), M(0.81, 1.0, [L(0.81, -1.0)])],
       };
     }
@@ -615,10 +654,10 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
       if (entry === 'from-low') {
         // Seamlessly climbs from (0.0, 0.50) at exact unified slope 2.53 into r's petite open top knot
         const stemX = 0.60;
-        const ex = stemX + HOOK_REACH;
+        const ex = stemX + hookReach(nextIsE);
         return {
           width: ex,
-          exitKind: 'low',
+          exitKind: lowExitKind,
           exitX: ex,
           strokes: [
             M(0.0, 0.50, [
@@ -627,17 +666,17 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
               C(0.07, 1.01, 0.30, 0.95, 0.48, 0.98),
               C(0.56, 0.99, stemX, 0.92, stemX, 0.74),
               L(stemX, 0.26),
-              ...bottomHookSegments(stemX),
+              ...bottomHookSegments(stemX, nextIsE),
             ]),
           ],
         };
       }
       if (entry === 'from-high') {
         const stemX = 0.56;
-        const ex = stemX + HOOK_REACH;
+        const ex = stemX + hookReach(nextIsE);
         return {
           width: ex,
-          exitKind: 'low',
+          exitKind: lowExitKind,
           exitX: ex,
           strokes: [
             M(0.0, 0.76, [
@@ -646,26 +685,26 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
               C(0.08, 1.02, 0.28, 0.97, 0.44, 0.98),
               C(0.53, 0.99, stemX, 0.92, stemX, 0.74),
               L(stemX, 0.26),
-              ...bottomHookSegments(stemX),
+              ...bottomHookSegments(stemX, nextIsE),
             ]),
           ],
         };
       }
-      // Initial 'r'
+      // Initial 'r' (also used after b/v/w high knot, e.g. "br" in umbrella/brown)
       const stemX = 0.66;
-      const ex = stemX + HOOK_REACH;
+      const ex = stemX + hookReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
-          M(0.02, 0.04, [
-            C(0.14, 0.38, 0.26, 0.90, 0.28, 1.14),
-            C(0.30, 1.24, 0.18, 1.25, 0.17, 1.14),
-            C(0.16, 1.02, 0.36, 0.97, 0.52, 0.98),
-            C(0.62, 0.99, stemX, 0.92, stemX, 0.74),
+          M(0.02, 0.0, [
+            C(0.14, 0.34, 0.26, 0.90, 0.28, 1.14),
+            C(0.30, 1.24, 0.16, 1.25, 0.15, 1.14),
+            C(0.14, 1.02, 0.36, 0.98, 0.52, 0.98),
+            C(0.62, 0.98, stemX, 0.90, stemX, 0.72),
             L(stemX, 0.26),
-            ...bottomHookSegments(stemX),
+            ...bottomHookSegments(stemX, nextIsE),
           ]),
         ],
       };
@@ -711,8 +750,8 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
         exitKind: 'stop',
         exitX: 0.86,
         strokes: [
-          M(0.02, 0.04, [
-            C(0.18, 0.38, 0.32, 0.90, 0.34, 1.14),
+          M(0.02, 0.0, [
+            C(0.18, 0.36, 0.32, 0.90, 0.34, 1.14),
             C(0.36, 1.24, 0.24, 1.25, 0.23, 1.14),
             C(0.22, 1.02, 0.38, 0.92, 0.56, 0.80),
             C(0.76, 0.66, 0.82, 0.40, 0.74, 0.18),
@@ -729,14 +768,14 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
       // with zero kink or gap, then crisp straight stem 1.50->0.26 + smooth concave-upward exit hook.
       const stemX = entry === 'from-low' ? 0.18 : entry === 'from-high' ? 0.22 : 0.24;
       const lead = stemLeadIn(stemX, entry);
-      const ex = stemX + HOOK_REACH;
+      const ex = stemX + hookReach(nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           M(lead.startX, lead.startY, [lead.seg]),
-          M(stemX, 1.50, [L(stemX, 0.26), ...bottomHookSegments(stemX)]),
+          M(stemX, 1.50, [L(stemX, 0.26), ...bottomHookSegments(stemX, nextIsE)]),
           M(stemX - 0.21, 1.0, [L(stemX + 0.22, 1.0)]),
         ],
       };
@@ -745,11 +784,11 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
     case 'u': {
       const stem1 = entry === 'from-low' ? 0.18 : entry === 'from-high' ? 0.22 : 0.24;
       const stem2 = stem1 + 0.56;
-      const ex = stem2 + HOOK_REACH;
+      const ex = stem2 + hookReach(nextIsE);
       const lead = stemLeadIn(stem1, entry);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           M(lead.startX, lead.startY, [
@@ -758,7 +797,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
             C(stem1, 0.04, stem1 + 0.16, 0.0, stem1 + 0.30, 0.0),
             C(stem1 + 0.44, 0.0, stem2 - 0.04, 0.22, stem2, 0.58),
           ]),
-          M(stem2, 1.0, [L(stem2, 0.26), ...bottomHookSegments(stem2)]),
+          M(stem2, 1.0, [L(stem2, 0.26), ...bottomHookSegments(stem2, nextIsE)]),
         ],
       };
     }
@@ -840,17 +879,17 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
                 C(cx, 0.02, 0.24, -0.04, 0.08, 0.18),
               ]);
       const bx = cx + 0.26;
-      const ex = bx + 0.34;
+      const ex = bx + bowlReach(0.46, nextIsE);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           leftEntry,
           M(cx + 0.44, 0.80, [
             C(cx + 0.32, 1.04, cx + 0.02, 1.0, cx, 0.50),
             C(cx, 0.12, cx + 0.12, 0.0, bx, 0.0),
-            bowlExitSegment(bx, 0.34),
+            bowlExitSegment(bx, 0.46, nextIsE),
           ]),
         ],
       };
@@ -859,11 +898,11 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
     case 'y': {
       const stem1 = entry === 'from-low' ? 0.18 : entry === 'from-high' ? 0.22 : 0.24;
       const stem2 = stem1 + 0.56;
-      const ex = stem2 + DESC_EXIT_REACH;
+      const ex = stem2 + descReach(nextIsE);
       const lead = stemLeadIn(stem1, entry);
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           M(lead.startX, lead.startY, [
@@ -872,7 +911,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
             C(stem1, 0.04, stem1 + 0.16, 0.0, stem1 + 0.30, 0.0),
             C(stem1 + 0.44, 0.0, stem2 - 0.04, 0.22, stem2, 0.58),
           ]),
-          M(stem2, 1.0, deepDescenderLoopSegments(stem2)),
+          M(stem2, 1.0, deepDescenderLoopSegments(stem2, nextIsE)),
         ],
       };
     }
@@ -880,7 +919,7 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
     case 'z': {
       const off = entry === 'init' ? 0.0 : 0.06;
       const bx = 0.56 + off;
-      const ex = bx + 0.36;
+      const ex = bx + bowlReach(0.46, nextIsE);
       const topEntry: StrokeSegment[] =
         entry === 'from-low'
           ? [C(0.06, 0.652, 0.14, 0.98, 0.32, 0.98), C(0.48, 0.98, 0.64, 0.96, 0.78, 0.98)]
@@ -891,14 +930,14 @@ function buildLowercaseGlyph(ch: string, entry: EntryKind, nextConnects: boolean
       const startY = entry === 'from-low' ? 0.50 : entry === 'from-high' ? 0.76 : 0.82;
       return {
         width: ex,
-        exitKind: 'low',
+        exitKind: lowExitKind,
         exitX: ex,
         strokes: [
           M(startX, startY, [
             ...topEntry,
             C(0.52 + off, 0.66, 0.28 + off, 0.34, 0.10 + off, 0.04),
             C(0.26 + off, 0.0, 0.44 + off, 0.0, bx, 0.0),
-            bowlExitSegment(bx, 0.36),
+            bowlExitSegment(bx, 0.46, nextIsE),
           ]),
         ],
       };
@@ -1491,6 +1530,7 @@ function getDiacriticStrokes(
 }
 
 const OVAL_LEFT_CHARS = new Set(['a', 'c', 'd', 'g', 'o', 'q']);
+const HIGH_LIFT_BASELINE_CHARS = new Set(['r', 's']);
 
 function decomposeChar(char: string): { base: string; marks: string[]; isLower: boolean; isDbar: boolean } {
   if (char === 'đ') return { base: 'd', marks: [], isLower: true, isDbar: true };
@@ -1506,19 +1546,20 @@ export function resolveGlyph(
   char: string,
   entry: EntryKind = 'init',
   nextConnects = false,
-  nextIsOval = false
+  nextIsOval = false,
+  nextIsE = false
 ): GlyphDef {
   const { base, marks, isLower, isDbar } = decomposeChar(char);
 
   if (isLower) {
-    const baseGlyph = buildLowercaseGlyph(base, entry, nextConnects, nextIsOval);
+    const baseGlyph = buildLowercaseGlyph(base, entry, nextConnects, nextIsOval, nextIsE);
     if (baseGlyph) {
       let strokes = baseGlyph.strokes;
       if (isDbar) {
         strokes = [...strokes, M(0.56, 1.50, [L(1.00, 1.50)])];
       }
       if (marks.length > 0) {
-        const centerX = base === 'e' && entry !== 'init' ? 0.22 : baseGlyph.width * 0.42;
+        const centerX = base === 'e' ? (entry === 'init' ? 0.42 : 0.38) : baseGlyph.width * 0.42;
         strokes = [...strokes, ...getDiacriticStrokes(marks, centerX, false)];
       }
       return strokes === baseGlyph.strokes ? baseGlyph : { ...baseGlyph, strokes };
@@ -1560,20 +1601,27 @@ export function layoutVietText(text: string): { glyphs: PositionedGlyph[]; total
     const ch = chars[i];
     const info = meta[i];
     const nextInfo = i + 1 < meta.length ? meta[i + 1] : null;
-    const nextConnects = Boolean(nextInfo && nextInfo.isLower);
+    const nextIsHighLift = Boolean(nextInfo && nextInfo.isLower && HIGH_LIFT_BASELINE_CHARS.has(nextInfo.base));
+    const nextConnects = Boolean(nextInfo && nextInfo.isLower && !(info.base === 'o' && nextIsHighLift));
     const nextIsOval = Boolean(nextInfo && nextInfo.isLower && OVAL_LEFT_CHARS.has(nextInfo.base));
+    const nextIsE = Boolean(nextInfo && nextInfo.isLower && nextInfo.base === 'e');
+    const isHighLiftSelf = info.isLower && HIGH_LIFT_BASELINE_CHARS.has(info.base);
 
     let entry: EntryKind = 'init';
     if (info.isLower) {
-      if (prevExitKind === 'low') entry = 'from-low';
-      else if (prevExitKind === 'high') entry = 'from-high';
+      if (prevExitKind === 'low-e') entry = 'from-low-e';
+      else if (prevExitKind === 'low') entry = 'from-low';
+      else if (prevExitKind === 'high' && !isHighLiftSelf) entry = 'from-high';
     }
 
-    const glyph = resolveGlyph(ch, entry, nextConnects, nextIsOval);
+    const glyph = resolveGlyph(ch, entry, nextConnects, nextIsOval, nextIsE);
 
     let gx = cursor;
     if (info.isLower && prevExitKind) {
-      if (prevExitKind === 'low') {
+      if (prevExitKind === 'low-e') {
+        // Exact point-to-point C1 join into lowercase 'e' at (prevExitAbsX, 0.20)
+        gx = prevExitAbsX;
+      } else if (prevExitKind === 'low') {
         if (glyph.isOvalLeft) {
           // Previous bottom hook sweeps directly to kiss the left belly of a/c/d/đ/g/o/q
           gx = prevExitAbsX - (glyph.ovalTouchLowX ?? 0.07);
@@ -1584,14 +1632,17 @@ export function layoutVietText(text: string): { glyphs: PositionedGlyph[]; total
       } else if (prevExitKind === 'high') {
         if (glyph.isOvalLeft) {
           // High ribbon knot (b/v/w) kisses upper-left shoulder of a/c/d/đ/g/o/q
-          gx = prevExitAbsX - (glyph.ovalTouchHighX ?? 0.15);
+          gx = prevExitAbsX - (glyph.ovalTouchHighX ?? 0.13);
+        } else if (isHighLiftSelf) {
+          // After b/v/w ribbon knot: pen lifts cleanly and r/s starts at baseline right under the knot tip
+          gx = prevExitAbsX - 0.03;
         } else {
-          // Exact point-to-point join at (prevExitAbsX, 0.80)
+          // Exact point-to-point join at (prevExitAbsX, 0.76)
           gx = prevExitAbsX;
         }
       } else if (prevExitKind === 'oval-o') {
-        // Pure oval 'o' followed by another oval (oo, oa, og, od, oc): crisp tight optical kiss
-        gx = prevExitAbsX - 0.02;
+        // Pure oval 'o' followed by another oval or baseline-starting r/s
+        gx = isHighLiftSelf ? prevExitAbsX + 0.02 : prevExitAbsX - 0.02;
       } else if (prevExitKind === 'stop') {
         // After q or s: clean small breathing room before next initial lowercase letter
         gx = prevExitAbsX + 0.02;

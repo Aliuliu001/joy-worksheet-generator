@@ -31,7 +31,10 @@ import {
   WorksheetFontStyle,
   WorksheetType,
 } from '../types/worksheet';
+import { serializeLigatureOverlapsKey } from '../lib/customFontStore';
 import { vietTextToSvgData } from '../lib/vietPrimaryFont';
+import { AdvancedLigaturePanel } from './AdvancedLigaturePanel';
+import { CustomFontInspector } from './CustomFontInspector';
 import { SheetCanvasCard } from './SheetCanvasCard';
 
 const FONT_OPTIONS: Array<{
@@ -62,7 +65,12 @@ interface BuilderWorkspaceProps {
   onUploadCustomFonts: (files: FileList | File[]) => Promise<{ added: CustomFontAsset[]; errors: string[] }>;
   onSelectCustomFont: (font: CustomFontAsset) => void;
   onDeleteCustomFont: (id: string) => Promise<void>;
-  onUpdateCustomFontCalibration: (scale: number, baselineOffset: number) => void;
+  onUpdateCustomFontCalibration: (
+    scale: number,
+    baselineOffset: number,
+    letterSpacing: number,
+    ligatureOverlaps?: Record<string, number>
+  ) => void;
   onToggleWorksheetType: (type: WorksheetType) => void;
   onUpdateMixSection: (type: MixSectionType, patch: { enabled?: boolean; target?: number }) => void;
   onShuffleVersion: (version: number) => void;
@@ -823,10 +831,51 @@ export function BuilderWorkspace({
                   {customFonts.length === 0 ? (
                     <p className="text-[11px] text-slate-500 py-1">{copy.builder.customFontEmpty}</p>
                   ) : (
-                    <div className="space-y-1.5" role="radiogroup" aria-label={copy.builder.fontTabCustom}>
+                    <div className="space-y-2" role="radiogroup" aria-label={copy.builder.fontTabCustom}>
                       {customFonts.map((font) => {
                         const selected =
                           config.fontStyle === 'custom' && config.customFontId === font.id;
+                        const isNormalSize = config.fontSize === 'normal';
+                        const blocks = config.typingImageGridBlocks === 5 ? 5 : 4;
+                        const showOlyLines = Boolean(
+                          config.typingImageGridlines || config.guidelineOverlay
+                        );
+                        const swatchScale = selected
+                          ? (config.customFontScale ?? 1)
+                          : font.scale;
+                        const swatchOffset = selected
+                          ? (config.customFontBaselineOffset ?? 0)
+                          : font.baselineOffset;
+                        const swatchLetterSpacing = selected
+                          ? (config.customFontLetterSpacing ?? 0)
+                          : font.letterSpacing;
+                        const swatchLigatures = selected
+                          ? (config.customFontLigatureOverlaps ?? {})
+                          : (font.ligatureOverlaps ?? {});
+                        const activeLigatureCount = Object.values(swatchLigatures).filter(
+                          (v) => Math.abs(v) >= 1
+                        ).length;
+                        const aboveRows = isNormalSize ? Math.max(blocks, 5) : blocks;
+                        const descRows = 2;
+                        const totalRows = aboveRows + descRows;
+                        const svgH = 48;
+                        const cellPx = Math.floor((svgH - 6) / totalRows);
+                        const gridTopY = Math.round((svgH - cellPx * totalRows) / 2);
+                        const baselineY = gridTopY + cellPx * aboveRows;
+                        const xHeightRow = aboveRows - (isNormalSize ? 2 : 1);
+                        const blockMajorRow = aboveRows - blocks;
+                        const textScale = isNormalSize ? 2 : 1;
+                        const previewFontPx = Math.max(
+                          10,
+                          Math.min(34, cellPx * 1.92 * textScale * swatchScale)
+                        );
+                        const textY = baselineY - swatchOffset * cellPx * textScale;
+                        const hasCalibration =
+                          Math.abs(swatchScale - 1) > 0.005 ||
+                          Math.abs(swatchOffset) > 0.005 ||
+                          Math.abs(swatchLetterSpacing) > 0.005 ||
+                          activeLigatureCount > 0;
+
                         return (
                           <div
                             key={font.id}
@@ -840,37 +889,29 @@ export function BuilderWorkspace({
                                 onSelectCustomFont(font);
                               }
                             }}
-                            className={`px-3 py-2 rounded-lg border transition-colors cursor-pointer flex items-center justify-between gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 ${
+                            className={`p-2.5 rounded-lg border transition-colors cursor-pointer space-y-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 ${
                               selected
                                 ? 'bg-blue-50/70 border-blue-600 text-slate-950'
                                 : 'bg-white border-slate-200 text-slate-700 hover:border-slate-300 hover:bg-slate-50'
                             }`}
                           >
-                            <div className="min-w-0 flex-1">
+                            <div className="flex items-center justify-between gap-2">
                               <div className="flex items-baseline gap-2 min-w-0">
                                 <span className="text-xs font-semibold truncate">{font.name}</span>
                                 <span className="text-[10px] font-mono uppercase text-slate-400 shrink-0">
                                   {font.format}
                                 </span>
-                              </div>
-                            </div>
-
-                            <div className="flex items-center gap-2.5 shrink-0">
-                              <div className="relative px-1 py-0.5">
-                                <div
-                                  aria-hidden="true"
-                                  className="pointer-events-none absolute inset-x-0 bottom-[5px] border-b border-blue-400/70"
-                                />
-                                <div
-                                  aria-hidden="true"
-                                  className="pointer-events-none absolute inset-x-0 bottom-[12px] border-b border-blue-200"
-                                />
-                                <span
-                                  className="relative text-sm text-slate-800 leading-none select-none"
-                                  style={{ fontFamily: `"${font.familyName}", sans-serif` }}
-                                >
-                                  Abc cat
-                                </span>
+                                {hasCalibration && (
+                                  <span className="text-[10px] font-mono text-slate-500 tabular-nums shrink-0">
+                                    {Math.round(swatchScale * 100)}% ·{' '}
+                                    {swatchOffset > 0 ? '+' : ''}
+                                    {swatchOffset.toFixed(2)}
+                                    {Math.abs(swatchLetterSpacing) > 0.005
+                                      ? ` · ${swatchLetterSpacing > 0 ? '+' : ''}${swatchLetterSpacing.toFixed(2)}em`
+                                      : ''}
+                                    {activeLigatureCount > 0 ? ` · ${activeLigatureCount} lig` : ''}
+                                  </span>
+                                )}
                               </div>
 
                               <button
@@ -881,10 +922,91 @@ export function BuilderWorkspace({
                                   e.stopPropagation();
                                   void onDeleteCustomFont(font.id);
                                 }}
-                                className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
+                                className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors shrink-0"
                               >
                                 <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
                               </button>
+                            </div>
+
+                            {/* Live settings-aware text preview swatch */}
+                            <div
+                              className="w-full h-12 rounded-md border border-slate-200/80 bg-white overflow-hidden"
+                              aria-hidden="true"
+                            >
+                              <svg
+                                width="100%"
+                                height={svgH}
+                                className="block w-full h-full"
+                                preserveAspectRatio="none"
+                              >
+                                {showOlyLines ? (
+                                  <>
+                                    {config.typingImageGridlines &&
+                                      Array.from({ length: 48 }, (_, c) => {
+                                        const vx = c * cellPx;
+                                        const isMajor = c % blocks === 0;
+                                        return (
+                                          <line
+                                            key={`v-${c}`}
+                                            x1={vx}
+                                            y1={gridTopY}
+                                            x2={vx}
+                                            y2={gridTopY + cellPx * totalRows}
+                                            stroke={isMajor ? '#93C5FD' : '#E2EEFD'}
+                                            strokeWidth={isMajor ? 0.75 : 0.45}
+                                          />
+                                        );
+                                      })}
+                                    {Array.from({ length: totalRows + 1 }, (_, r) => {
+                                      const hy = gridTopY + r * cellPx;
+                                      const isBase = r === aboveRows;
+                                      const isMajor = r === blockMajorRow;
+                                      const isX = r === xHeightRow;
+                                      return (
+                                        <line
+                                          key={`h-${r}`}
+                                          x1="0"
+                                          y1={hy}
+                                          x2="100%"
+                                          y2={hy}
+                                          stroke={
+                                            isBase
+                                              ? '#2563EB'
+                                              : isMajor
+                                                ? '#60A5FA'
+                                                : isX
+                                                  ? '#93C5FD'
+                                                  : '#DCEBFC'
+                                          }
+                                          strokeWidth={isBase ? 1.15 : isMajor ? 0.75 : 0.5}
+                                        />
+                                      );
+                                    })}
+                                  </>
+                                ) : (
+                                  <line
+                                    x1="8"
+                                    y1={baselineY}
+                                    x2="100%"
+                                    y2={baselineY}
+                                    stroke="#CBD5E1"
+                                    strokeWidth="0.8"
+                                    strokeDasharray="3 3"
+                                  />
+                                )}
+                                <text
+                                  x={10}
+                                  y={textY}
+                                  fill="#0F172A"
+                                  fontSize={previewFontPx}
+                                  style={{
+                                    fontFamily: `"${font.familyName}", sans-serif`,
+                                    letterSpacing: `${swatchLetterSpacing}em`,
+                                  }}
+                                >
+                                  Aa Bb cat tree ice cream
+                                </text>
+                              </svg>
                             </div>
                           </div>
                         );
@@ -894,7 +1016,7 @@ export function BuilderWorkspace({
                 </div>
               )}
 
-              {/* Real-time Scale & Baseline Offset calibration sliders for active custom font */}
+              {/* Real-time Scale, Baseline Offset & Letter Spacing calibration sliders for active custom font */}
               {isCustomFontActive && activeCustomFont && (
                 <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50/80 p-3 space-y-3">
                   <div className="flex items-center justify-between gap-2">
@@ -911,9 +1033,11 @@ export function BuilderWorkspace({
                       type="button"
                       disabled={
                         (config.customFontScale ?? 1) === 1 &&
-                        (config.customFontBaselineOffset ?? 0) === 0
+                        (config.customFontBaselineOffset ?? 0) === 0 &&
+                        (config.customFontLetterSpacing ?? 0) === 0 &&
+                        Object.keys(config.customFontLigatureOverlaps || {}).length === 0
                       }
-                      onClick={() => onUpdateCustomFontCalibration(1, 0)}
+                      onClick={() => onUpdateCustomFontCalibration(1, 0, 0, {})}
                       className="inline-flex items-center gap-1 text-[11px] font-medium text-blue-700 hover:text-blue-900 disabled:text-slate-400 whitespace-nowrap shrink-0"
                     >
                       <RotateCcw className="w-3 h-3" aria-hidden="true" />
@@ -941,7 +1065,8 @@ export function BuilderWorkspace({
                       onChange={(e) =>
                         onUpdateCustomFontCalibration(
                           Number(e.target.value),
-                          config.customFontBaselineOffset ?? 0
+                          config.customFontBaselineOffset ?? 0,
+                          config.customFontLetterSpacing ?? 0
                         )
                       }
                       className="w-full h-1.5 accent-blue-700 cursor-pointer"
@@ -984,7 +1109,8 @@ export function BuilderWorkspace({
                           onChange={(e) =>
                             onUpdateCustomFontCalibration(
                               config.customFontScale ?? 1,
-                              Number(e.target.value)
+                              Number(e.target.value),
+                              config.customFontLetterSpacing ?? 0
                             )
                           }
                           className="w-full h-1.5 accent-blue-700 cursor-pointer"
@@ -997,6 +1123,88 @@ export function BuilderWorkspace({
                       </div>
                     );
                   })()}
+
+                  {/* Letter Spacing / Kerning Slider */}
+                  {(() => {
+                    const spacing = config.customFontLetterSpacing ?? 0;
+                    const sign = spacing > 0 ? '+' : '';
+                    return (
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <label
+                            htmlFor="custom-font-letter-spacing"
+                            className="text-[11px] font-semibold text-slate-700"
+                          >
+                            {copy.builder.customFontLetterSpacingLabel}
+                          </label>
+                          <span className="text-[11px] font-mono text-slate-700 tabular-nums">
+                            {sign}
+                            {spacing.toFixed(2)} em
+                          </span>
+                        </div>
+                        <input
+                          id="custom-font-letter-spacing"
+                          type="range"
+                          min={-0.12}
+                          max={0.35}
+                          step={0.01}
+                          value={spacing}
+                          onChange={(e) =>
+                            onUpdateCustomFontCalibration(
+                              config.customFontScale ?? 1,
+                              config.customFontBaselineOffset ?? 0,
+                              Number(e.target.value)
+                            )
+                          }
+                          className="w-full h-1.5 accent-blue-700 cursor-pointer"
+                        />
+                        <div className="flex justify-between text-[10px] font-mono text-slate-400 tabular-nums">
+                          <span>-0.12 em</span>
+                          <span>0.00 em</span>
+                          <span>+0.35 em</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Live Character Inspector & Calibration Auto-Fix */}
+                  <CustomFontInspector
+                    font={activeCustomFont}
+                    scale={config.customFontScale ?? 1}
+                    baselineOffset={config.customFontBaselineOffset ?? 0}
+                    letterSpacing={config.customFontLetterSpacing ?? 0}
+                    ligatureOverlaps={config.customFontLigatureOverlaps || {}}
+                    fontSize={config.fontSize === 'normal' ? 'normal' : 'small'}
+                    gridBlocks={config.typingImageGridBlocks === 5 ? 5 : 4}
+                    copy={copy}
+                    onApplyLetterSpacing={(nextLetterSpacing) =>
+                      onUpdateCustomFontCalibration(
+                        config.customFontScale ?? 1,
+                        config.customFontBaselineOffset ?? 0,
+                        nextLetterSpacing
+                      )
+                    }
+                  />
+
+                  {/* Advanced Ligature Per-Pair Join Overlap Controls */}
+                  <AdvancedLigaturePanel
+                    font={activeCustomFont}
+                    scale={config.customFontScale ?? 1}
+                    baselineOffset={config.customFontBaselineOffset ?? 0}
+                    letterSpacing={config.customFontLetterSpacing ?? 0}
+                    ligatureOverlaps={config.customFontLigatureOverlaps || {}}
+                    fontSize={config.fontSize === 'normal' ? 'normal' : 'small'}
+                    gridBlocks={config.typingImageGridBlocks === 5 ? 5 : 4}
+                    copy={copy}
+                    onChangeLigatureOverlaps={(nextOverlaps) =>
+                      onUpdateCustomFontCalibration(
+                        config.customFontScale ?? 1,
+                        config.customFontBaselineOffset ?? 0,
+                        config.customFontLetterSpacing ?? 0,
+                        nextOverlaps
+                      )
+                    }
+                  />
                 </div>
               )}
 
@@ -1224,7 +1432,7 @@ export function BuilderWorkspace({
                     key={desc.id}
                     descriptor={desc}
                     targetWidth={desc.widthPt > desc.heightPt ? 660 : 500}
-                    renderKey={`${desc.id}-${shuffleNonce}-${config.difficulty}-${config.studentHeader}-${config.matching3Count}-${config.matching3TwoUp}-${config.fontStyle}-${config.customFontId || ''}-${config.customFontScale ?? 1}-${config.customFontBaselineOffset ?? 0}-${config.fontSize || 'small'}-${config.guidelineOverlay}-${config.typingImageGridlines}-${config.typingImageGridSize}-${config.typingImageGridBlocks}-${config.typingImageShowSample}-${config.wordScrambleShowHint}`}
+                    renderKey={`${desc.id}-${shuffleNonce}-${config.difficulty}-${config.studentHeader}-${config.matching3Count}-${config.matching3TwoUp}-${config.fontStyle}-${config.customFontId || ''}-${config.customFontScale ?? 1}-${config.customFontBaselineOffset ?? 0}-${config.customFontLetterSpacing ?? 0}-${serializeLigatureOverlapsKey(config.customFontLigatureOverlaps)}-${config.fontSize || 'small'}-${config.guidelineOverlay}-${config.typingImageGridlines}-${config.typingImageGridSize}-${config.typingImageGridBlocks}-${config.typingImageShowSample}-${config.wordScrambleShowHint}`}
                   />
                 ))
               )}

@@ -265,6 +265,8 @@ export const DEFAULT_CONFIG: WorksheetConfig = {
   customFontId: null,
   customFontScale: 1,
   customFontBaselineOffset: 0,
+  customFontLetterSpacing: 0,
+  customFontLigatureOverlaps: {},
 };
 
 export function cleanText(value: unknown): string {

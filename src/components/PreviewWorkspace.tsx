@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Download, Maximize2, Printer, Shuffle, ZoomIn, ZoomOut } from 'lucide-react';
+import { serializeLigatureOverlapsKey } from '../lib/customFontStore';
 import { Dictionary } from '../lib/i18n';
 import { buildPreviewDescriptors, downloadSinglePreviewPdf } from '../lib/pdfEngine';
 import {
@@ -488,7 +489,7 @@ export function PreviewWorkspace({
                   descriptor={desc}
                   targetWidth={targetW}
                   allowOverflow
-                  renderKey={`${desc.id}-${shuffleNonce}-${zoomMode}-${targetW}-${config.difficulty}-${config.studentHeader}-${config.fontStyle}-${config.customFontId || ''}-${config.customFontScale ?? 1}-${config.customFontBaselineOffset ?? 0}-${config.fontSize || 'small'}-${config.guidelineOverlay}-${config.typingImageGridlines}-${config.typingImageGridSize}-${config.typingImageGridBlocks}-${config.typingImageShowSample}-${config.wordScrambleShowHint}`}
+                  renderKey={`${desc.id}-${shuffleNonce}-${zoomMode}-${targetW}-${config.difficulty}-${config.studentHeader}-${config.fontStyle}-${config.customFontId || ''}-${config.customFontScale ?? 1}-${config.customFontBaselineOffset ?? 0}-${config.customFontLetterSpacing ?? 0}-${serializeLigatureOverlapsKey(config.customFontLigatureOverlaps)}-${config.fontSize || 'small'}-${config.guidelineOverlay}-${config.typingImageGridlines}-${config.typingImageGridSize}-${config.typingImageGridBlocks}-${config.typingImageShowSample}-${config.wordScrambleShowHint}`}
                 />
               );
             })}
